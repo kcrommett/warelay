@@ -195,6 +195,9 @@ export async function getReplyFromConfig(
   let persistedThinking: string | undefined;
   let persistedVerbose: string | undefined;
 
+  // Track if this is a reset-only message (e.g., just "/new" with no prompt)
+  let isResetOnlyMessage = false;
+
   if (sessionCfg) {
     const trimmedBody = (ctx.Body ?? "").trim();
     for (const trigger of resetTriggers) {
@@ -202,6 +205,7 @@ export async function getReplyFromConfig(
       if (trimmedBody === trigger) {
         isNewSession = true;
         bodyStripped = "";
+        isResetOnlyMessage = true;
         break;
       }
       const triggerPrefix = `${trigger} `;
@@ -381,6 +385,12 @@ export async function getReplyFromConfig(
     }
     cleanupTyping();
     return { text: "Agent was aborted." };
+  }
+
+  // Handle reset-only messages (e.g., just "/new" with no prompt)
+  if (isResetOnlyMessage && reply?.mode === "command") {
+    cleanupTyping();
+    return { text: `New session started (${sessionId}).` };
   }
 
   await startTypingLoop();
