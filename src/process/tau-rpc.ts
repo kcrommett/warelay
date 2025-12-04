@@ -3,11 +3,22 @@ import readline from "node:readline";
 
 import { piSpec } from "../agents/pi.js";
 
+type PromptPayload =
+  | string
+  | {
+      role?: string;
+      content?: Array<{ type?: string; text?: unknown }>;
+      text?: unknown;
+    }
+  | { text?: unknown }
+  | unknown;
+
 type TauRpcOptions = {
   argv: string[];
   cwd?: string;
   timeoutMs: number;
   onEvent?: (line: string) => void;
+  prompt: PromptPayload;
 };
 
 type TauRpcResult = {
@@ -17,6 +28,57 @@ type TauRpcResult = {
   signal?: NodeJS.Signals | null;
   killed?: boolean;
 };
+
+export function normalizePiPrompt(prompt: PromptPayload): {
+  text: string;
+  coerced: boolean;
+} {
+  if (typeof prompt === "string") return { text: prompt, coerced: false };
+
+  // Attempt to extract text content from a message-like payload.
+  if (prompt && typeof prompt === "object") {
+    const content = (prompt as { content?: unknown }).content;
+    if (Array.isArray(content)) {
+      const parts = content
+        .map((c) => {
+          if (typeof c === "string") return c;
+          if (c && typeof c === "object") {
+            const text = (c as { text?: unknown }).text;
+            if (typeof text === "string") return text;
+          }
+          return "";
+        })
+        .filter(Boolean);
+      const combined = parts.join("\n").trim();
+      if (combined) return { text: combined, coerced: true };
+    }
+
+    const text = (prompt as { text?: unknown }).text;
+    if (typeof text === "string") return { text, coerced: true };
+  }
+
+  try {
+    const json = JSON.stringify(prompt);
+    if (json) return { text: json, coerced: true };
+  } catch {
+    // fall through to string coercion below
+  }
+
+  return {
+    text: prompt == null ? "" : String(prompt),
+    coerced: true,
+  };
+}
+
+function previewPrompt(prompt: PromptPayload): string | undefined {
+  if (typeof prompt === "string") return prompt.slice(0, 120);
+  try {
+    const json = JSON.stringify(prompt);
+    return json ? json.slice(0, 120) : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 class TauRpcClient {
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -58,7 +120,12 @@ class TauRpcClient {
         const out = this.buffer.join("\n");
         clearTimeout(pending.timer);
         // Treat process exit as completion with whatever output we captured.
-        pending.resolve({ stdout: out, stderr: this.stderr, code: code ?? 0, signal });
+        pending.resolve({
+          stdout: out,
+          stderr: this.stderr,
+          code: code ?? 0,
+          signal,
+        });
       }
       this.dispose();
     });
@@ -89,10 +156,17 @@ class TauRpcClient {
   }
 
   async prompt(
-    prompt: string,
+    prompt: PromptPayload,
     timeoutMs: number,
     onEvent?: (line: string) => void,
   ): Promise<TauRpcResult> {
+    const { text: promptText, coerced } = normalizePiPrompt(prompt);
+    const preview = coerced ? previewPrompt(prompt) : undefined;
+    if (coerced) {
+      const suffix = preview ? ` (preview: ${preview})` : "";
+      console.warn(`tau rpc: coerced non-string prompt to text${suffix}`);
+    }
+
     this.ensureChild();
     if (this.pending) {
       throw new Error("tau rpc already handling a request");
@@ -103,7 +177,7 @@ class TauRpcClient {
       const ok = child.stdin.write(
         `${JSON.stringify({
           type: "prompt",
-          message: { role: "user", content: [{ type: "text", text: prompt }] },
+          message: promptText,
         })}\n`,
         (err) => (err ? reject(err) : resolve()),
       );
@@ -135,9 +209,7 @@ class TauRpcClient {
 
 let singleton: { key: string; client: TauRpcClient } | undefined;
 
-export async function runPiRpc(
-  opts: TauRpcOptions & { prompt: string },
-): Promise<TauRpcResult> {
+export async function runPiRpc(opts: TauRpcOptions): Promise<TauRpcResult> {
   const key = `${opts.cwd ?? ""}|${opts.argv.join(" ")}`;
   if (!singleton || singleton.key !== key) {
     singleton?.client.dispose();
