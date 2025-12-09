@@ -14,6 +14,7 @@ import {
   saveSessionStore,
 } from "../config/sessions.js";
 import { isVerbose, logVerbose } from "../globals.js";
+import { getChildLogger } from "../logging.js";
 import { buildProviderSummary } from "../infra/provider-summary.js";
 import { triggerWarelayRestart } from "../infra/restart.js";
 import { drainSystemEvents } from "../infra/system-events.js";
@@ -171,8 +172,15 @@ export async function getReplyFromConfig(
   const timeoutSeconds = Math.max(reply?.timeoutSeconds ?? 600, 1);
   const timeoutMs = timeoutSeconds * 1000;
   let started = false;
+  const replyLogger = getChildLogger({ module: "reply" });
   const triggerTyping = async () => {
-    await opts?.onReplyStart?.();
+    replyLogger.debug("Triggering typing indicator");
+    try {
+      await opts?.onReplyStart?.();
+      replyLogger.debug("Typing indicator sent successfully");
+    } catch (err) {
+      replyLogger.warn({ error: String(err) }, "Typing indicator failed");
+    }
   };
   const onReplyStart = async () => {
     if (started) return;

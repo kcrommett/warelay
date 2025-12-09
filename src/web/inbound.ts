@@ -188,9 +188,14 @@ export async function monitorWebInbox(options: {
       const chatJid = remoteJid;
       const sendComposing = async () => {
         try {
+          logVerbose(`Sending composing presence to ${chatJid}`);
+          // Subscribe to presence first (workaround for Baileys issue #866)
+          await sock.presenceSubscribe(chatJid);
+          await sock.sendPresenceUpdate("available", chatJid);
           await sock.sendPresenceUpdate("composing", chatJid);
+          logVerbose(`Composing presence sent successfully to ${chatJid}`);
         } catch (err) {
-          logVerbose(`Presence update failed: ${String(err)}`);
+          logVerbose(`Presence update failed for ${chatJid}: ${String(err)}`);
         }
       };
       const reply = async (text: string) => {

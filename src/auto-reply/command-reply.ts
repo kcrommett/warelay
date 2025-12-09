@@ -437,7 +437,8 @@ export async function runCommandReply(
 
     // Tau (pi agent) needs --continue to reload prior messages when resuming.
     // Without it, pi starts from a blank state even though we pass the session file path.
-    if (!isNewSession && !sessionArgList.includes("--continue")) {
+    // Skip this for Claude commands which use --resume <id> directly.
+    if (!isClaudeCommand && !isNewSession && !sessionArgList.includes("--continue")) {
       sessionArgList.push("--continue");
     }
 

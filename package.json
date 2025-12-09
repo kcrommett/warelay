@@ -13,6 +13,7 @@
     "start": "tsx src/index.ts",
     "clawdis": "tsx src/index.ts",
     "clawdis:rpc": "tsx src/index.ts agent --mode rpc --json",
+    "dev:relay": "tsx src/index.ts relay --verbose",
     "lint": "biome check src",
     "lint:fix": "biome check --write --unsafe src && biome format --write src",
     "format": "biome format src",
