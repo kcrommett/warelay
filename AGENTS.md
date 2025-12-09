@@ -46,6 +46,12 @@
   - launchd PATH is minimal; ensure the app’s launch agent sets PATH to include `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/steipete/Library/pnpm` so `pnpm`/`clawdis` binaries resolve when invoked via `clawdis-mac`.
   - For manual `clawdis send` messages that include `!`, use the heredoc pattern noted below to avoid the Bash tool’s escaping.
 
+## Operational Notes (2025-12)
+- Restart helper: `bin/restart-warelay.sh` wraps bootout/bootstrap/kickstart for `com.steipete.warelay`. If it reports an I/O error, rerun the manual sequence: `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.steipete.warelay.plist && launchctl kickstart -k gui/$UID/com.steipete.warelay`.
+- LaunchAgent: `~/Library/LaunchAgents/com.steipete.warelay.plist` points to `/Users/shuv/.local/share/pnpm/warelay relay --verbose`; ensure `PNPM_HOME` is `/Users/shuv/.local/share/pnpm` and the global link exists (`pnpm link --global`). PATH in the plist includes PNPM_HOME.
+- Session intro delivery: the `sessionIntro` is only prepended once per sender; the flag lives in `~/.warelay/sessions.json` (`systemSent`). Set it back to `false` to force resending the intro without changing the session ID.
+- Pi session files for warelay live in `/Users/shuv/clawd/<sessionId>`; if a `--continue` session is corrupted, move the file aside (`.bak`) to force a fresh session while keeping warelay’s session store intact.
+
 ## Exclamation Mark Escaping Workaround
 The Claude Code Bash tool escapes `!` to `\\!` in command arguments. When using `clawdis send` with messages containing exclamation marks, use heredoc syntax:
 

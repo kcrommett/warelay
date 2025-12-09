@@ -33,6 +33,40 @@ export async function createWaSocket(printQr: boolean, verbose: boolean) {
     },
   );
   const logger = toPinoLikeLogger(baseLogger, verbose ? "info" : "silent");
+
+  // Filter noisy Baileys state dumps (e.g., SessionEntry chain dumps) to keep logs readable.
+  const loggerAny = logger as unknown as Record<string, unknown>;
+  const isNoisyBaileysState = (args: unknown[]) =>
+    args.some((arg) => {
+      if (!arg || typeof arg !== "object") return false;
+      const obj = arg as Record<string, unknown>;
+      return (
+        "_chains" in obj ||
+        "currentRatchet" in obj ||
+        "pendingPreKey" in obj ||
+        "ephemeralKeyPair" in obj ||
+        "lastRemoteEphemeralKey" in obj ||
+        "rootKey" in obj
+      );
+    });
+
+  const wrapLog = (fn: unknown) => {
+    if (typeof fn !== "function") return fn;
+    const boundFn = (fn as (...args: unknown[]) => unknown).bind(logger);
+    return (...args: unknown[]) => {
+      if (isNoisyBaileysState(args)) return;
+      return boundFn(...args);
+    };
+  };
+
+  loggerAny.info = wrapLog(loggerAny.info);
+  loggerAny.debug = wrapLog(loggerAny.debug);
+
+  // Some Baileys internals call logger.trace even when silent; ensure it's present.
+  if (typeof loggerAny.trace !== "function") {
+    loggerAny.trace = () => {};
+  }
+
   await ensureDir(WA_WEB_AUTH_DIR);
   const { state, saveCreds } = await useMultiFileAuthState(WA_WEB_AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
