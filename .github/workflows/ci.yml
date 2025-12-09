@@ -7,20 +7,39 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [node, bun]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Node.js
+        if: matrix.runtime == 'node'
         uses: actions/setup-node@v4
         with:
           node-version: 22
           check-latest: true
 
-      - name: Node version
+      - name: Setup Bun
+        if: matrix.runtime == 'bun'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.x"
+
+      - name: Setup Node.js (tooling for bun)
+        if: matrix.runtime == 'bun'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          check-latest: true
+
+      - name: Runtime versions
         run: |
           node -v
           npm -v
+          if [ "${{ matrix.runtime }}" = "bun" ]; then bun -v; fi
 
       - name: Capture node path
         run: echo "NODE_BIN=$(dirname \"$(node -p \"process.execPath\")\")" >> "$GITHUB_ENV"
@@ -41,11 +60,59 @@ jobs:
           pnpm -v
           pnpm install --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true || pnpm install --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true
 
-      - name: Lint
+      - name: Lint (node)
+        if: matrix.runtime == 'node'
         run: pnpm lint
 
-      - name: Test
+      - name: Test (node)
+        if: matrix.runtime == 'node'
         run: pnpm test
 
-      - name: Build
+      - name: Build (node)
+        if: matrix.runtime == 'node'
         run: pnpm build
+
+      - name: Lint (bun)
+        if: matrix.runtime == 'bun'
+        run: bunx biome check src
+
+      - name: Test (bun)
+        if: matrix.runtime == 'bun'
+        run: bunx vitest run
+
+      - name: Build (bun)
+        if: matrix.runtime == 'bun'
+        run: bunx tsc -p tsconfig.json
+
+  macos-app:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26.1
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.1.app
+          xcodebuild -version
+
+      - name: Install SwiftLint / SwiftFormat
+        run: |
+          brew install swiftlint swiftformat
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: SwiftLint
+        run: swiftlint --config .swiftlint.yml
+
+      - name: SwiftFormat (lint mode)
+        run: swiftformat --lint apps/macos/Sources --config .swiftformat
+
+      - name: Swift build (release)
+        run: swift build --package-path apps/macos --configuration release
+
+      - name: Swift tests
+        run: swift test --package-path apps/macos --parallel

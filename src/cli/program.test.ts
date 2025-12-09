@@ -2,16 +2,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const sendCommand = vi.fn();
 const statusCommand = vi.fn();
-const webhookCommand = vi.fn().mockResolvedValue(undefined);
-const ensureTwilioEnv = vi.fn();
 const loginWeb = vi.fn();
 const monitorWebProvider = vi.fn();
-const pickProvider = vi.fn();
-const monitorTwilio = vi.fn();
-const logTwilioFrom = vi.fn();
 const logWebSelfId = vi.fn();
 const waitForever = vi.fn();
-const spawnRelayTmux = vi.fn().mockResolvedValue("warelay-relay");
+const monitorTelegramProvider = vi.fn();
+const startWebChatServer = vi.fn(async () => ({ port: 18788 }));
+const ensureWebChatServerFromConfig = vi.fn(async () => ({ port: 18788 }));
 
 const runtime = {
   log: vi.fn(),
@@ -23,21 +20,23 @@ const runtime = {
 
 vi.mock("../commands/send.js", () => ({ sendCommand }));
 vi.mock("../commands/status.js", () => ({ statusCommand }));
-vi.mock("../commands/webhook.js", () => ({ webhookCommand }));
-vi.mock("../env.js", () => ({ ensureTwilioEnv }));
 vi.mock("../runtime.js", () => ({ defaultRuntime: runtime }));
 vi.mock("../provider-web.js", () => ({
   loginWeb,
   monitorWebProvider,
-  pickProvider,
+}));
+vi.mock("../telegram/monitor.js", () => ({
+  monitorTelegramProvider,
+}));
+vi.mock("../webchat/server.js", () => ({
+  startWebChatServer,
+  ensureWebChatServerFromConfig,
+  getWebChatServer: () => null,
 }));
 vi.mock("./deps.js", () => ({
   createDefaultDeps: () => ({ waitForever }),
-  logTwilioFrom,
   logWebSelfId,
-  monitorTwilio,
 }));
-vi.mock("./relay_tmux.js", () => ({ spawnRelayTmux }));
 
 const { buildProgram } = await import("./program.js");
 
@@ -54,55 +53,22 @@ describe("cli program", () => {
     expect(sendCommand).toHaveBeenCalled();
   });
 
-  it("rejects invalid relay provider", async () => {
-    const program = buildProgram();
-    await expect(
-      program.parseAsync(["relay", "--provider", "bogus"], { from: "user" }),
-    ).rejects.toThrow("exit");
-    expect(runtime.error).toHaveBeenCalledWith(
-      "--provider must be auto, web, or twilio",
-    );
-  });
-
-  it("falls back to twilio when web relay fails", async () => {
-    pickProvider.mockResolvedValue("web");
-    monitorWebProvider.mockRejectedValue(new Error("no web"));
-    const program = buildProgram();
-    await expect(
-      program.parseAsync(
-        ["relay", "--provider", "auto", "--interval", "2", "--lookback", "1"],
-        { from: "user" },
-      ),
-    ).rejects.toThrow("exit");
-    expect(logWebSelfId).toHaveBeenCalled();
-    expect(ensureTwilioEnv).not.toHaveBeenCalled();
-    expect(monitorTwilio).not.toHaveBeenCalled();
-  });
-
-  it("runs relay tmux attach command", async () => {
-    const originalIsTTY = process.stdout.isTTY;
-    (process.stdout as typeof process.stdout & { isTTY?: boolean }).isTTY =
-      true;
-
-    const program = buildProgram();
-    await program.parseAsync(["relay:tmux:attach"], { from: "user" });
-    expect(spawnRelayTmux).toHaveBeenCalledWith(
-      "pnpm warelay relay --verbose",
-      true,
-      false,
-    );
-
-    (process.stdout as typeof process.stdout & { isTTY?: boolean }).isTTY =
-      originalIsTTY;
-  });
-
-  it("runs relay heartbeat command", async () => {
-    pickProvider.mockResolvedValue("web");
+  it("starts relay with heartbeat tuning", async () => {
     monitorWebProvider.mockResolvedValue(undefined);
-    const originalExit = runtime.exit;
-    runtime.exit = vi.fn();
     const program = buildProgram();
-    await program.parseAsync(["relay:heartbeat"], { from: "user" });
+    await program.parseAsync(
+      [
+        "relay",
+        "--web-heartbeat",
+        "90",
+        "--heartbeat-now",
+        "--provider",
+        "web",
+      ],
+      {
+        from: "user",
+      },
+    );
     expect(logWebSelfId).toHaveBeenCalled();
     expect(monitorWebProvider).toHaveBeenCalledWith(
       false,
@@ -110,20 +76,53 @@ describe("cli program", () => {
       true,
       undefined,
       runtime,
-      undefined,
-      { replyHeartbeatNow: true },
+      expect.any(AbortSignal),
+      { heartbeatSeconds: 90, replyHeartbeatNow: true },
     );
-    expect(runtime.exit).not.toHaveBeenCalled();
-    runtime.exit = originalExit;
+    expect(monitorTelegramProvider).not.toHaveBeenCalled();
   });
 
-  it("runs relay heartbeat tmux helper", async () => {
+  it("runs telegram relay when token set", async () => {
     const program = buildProgram();
-    await program.parseAsync(["relay:heartbeat:tmux"], { from: "user" });
-    const shouldAttach = Boolean(process.stdout.isTTY);
-    expect(spawnRelayTmux).toHaveBeenCalledWith(
-      "pnpm warelay relay --verbose --heartbeat-now",
-      shouldAttach,
+    const prev = process.env.TELEGRAM_BOT_TOKEN;
+    process.env.TELEGRAM_BOT_TOKEN = "token123";
+    await program.parseAsync(["relay", "--provider", "telegram"], {
+      from: "user",
+    });
+    expect(monitorTelegramProvider).toHaveBeenCalledWith(
+      expect.objectContaining({ token: "token123" }),
+    );
+    expect(monitorWebProvider).not.toHaveBeenCalled();
+    process.env.TELEGRAM_BOT_TOKEN = prev;
+  });
+
+  it("errors when telegram provider requested without token", async () => {
+    const program = buildProgram();
+    const prev = process.env.TELEGRAM_BOT_TOKEN;
+    process.env.TELEGRAM_BOT_TOKEN = "";
+    await expect(
+      program.parseAsync(["relay", "--provider", "telegram"], {
+        from: "user",
+      }),
+    ).rejects.toThrow();
+    expect(runtime.error).toHaveBeenCalled();
+    expect(runtime.exit).toHaveBeenCalled();
+    process.env.TELEGRAM_BOT_TOKEN = prev;
+  });
+
+  it("runs status command", async () => {
+    const program = buildProgram();
+    await program.parseAsync(["status"], { from: "user" });
+    expect(statusCommand).toHaveBeenCalled();
+  });
+
+  it("starts webchat server and prints json", async () => {
+    const program = buildProgram();
+    runtime.log.mockClear();
+    await program.parseAsync(["webchat", "--json"], { from: "user" });
+    expect(startWebChatServer).toHaveBeenCalled();
+    expect(runtime.log).toHaveBeenCalledWith(
+      JSON.stringify({ port: 18788, basePath: "/webchat/", host: "127.0.0.1" }),
     );
   });
 });

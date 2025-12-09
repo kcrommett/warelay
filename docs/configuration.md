@@ -7,7 +7,7 @@ CLAWDIS uses a JSON configuration file at `~/.clawdis/clawdis.json`.
 ```json
 {
   "inbound": {
-    "allowFrom": ["+436769770569"],
+    "allowFrom": ["+15555550123"],
     "reply": {
       "mode": "command",
       "command": ["tau", "{{Body}}"]
@@ -26,8 +26,8 @@ CLAWDIS uses a JSON configuration file at `~/.clawdis/clawdis.json`.
   },
   "inbound": {
     "allowFrom": [
-      "+436769770569",
-      "+447511247203"
+      "+15555550123",
+      "+447700900123"
     ],
     "groupChat": {
       "requireMention": true,
@@ -43,7 +43,9 @@ CLAWDIS uses a JSON configuration file at `~/.clawdis/clawdis.json`.
       "mode": "command",
       "agent": {
         "kind": "pi",
-        "format": "json"
+        "format": "json",
+        "model": "claude-opus-4-5",
+        "contextTokens": 200000
       },
       "cwd": "/Users/you/clawd",
       "command": [
@@ -78,7 +80,7 @@ CLAWDIS uses a JSON configuration file at `~/.clawdis/clawdis.json`.
 Array of E.164 phone numbers allowed to trigger the AI. Use `["*"]` to allow everyone (dangerous!).
 
 ```json
-"allowFrom": ["+436769770569", "+447511247203"]
+"allowFrom": ["+15555550123", "+447700900123"]
 ```
 
 ### `inbound.groupChat`
@@ -99,6 +101,11 @@ Array of E.164 phone numbers allowed to trigger the AI. Use `["*"]` to allow eve
 | `timeoutSeconds` | number | Max time for agent to respond |
 | `heartbeatMinutes` | number | Interval for heartbeat pings |
 | `heartbeatBody` | string | Message sent on heartbeat |
+| `agent.kind` | string | Only `"pi"` is supported |
+| `agent.model` | string | Optional model name to annotate sessions (defaults to `claude-opus-4-5`) |
+| `agent.contextTokens` | number | Optional context window size; used for session token % reporting (defaults to ~200,000 for Opus 4.5) |
+
+> Quick start: If you omit `inbound.reply`, CLAWDIS falls back to the bundled `@mariozechner/pi-coding-agent` with `--mode rpc`, per-sender sessions, and a 200k-token window. No extra install or config needed to get a reply.
 
 ### Template Variables
 
@@ -142,15 +149,15 @@ export CLAWDIS_CONFIG_PATH=~/.clawdis/clawdis.json
 
 ## Migrating from Warelay
 
-If you're upgrading from the old `warelay` name:
+If you're upgrading from the old `clawdis` name:
 
 ```bash
 # Move config
-mv ~/.warelay ~/.clawdis
-mv ~/.clawdis/warelay.json ~/.clawdis/clawdis.json
+mv ~/.clawdis ~/.clawdis
+mv ~/.clawdis/clawdis.json ~/.clawdis/clawdis.json
 
 # Update any hardcoded paths in your config
-sed -i '' 's/warelay/clawdis/g' ~/.clawdis/clawdis.json
+sed -i '' 's/clawdis/clawdis/g' ~/.clawdis/clawdis.json
 ```
 
 ---

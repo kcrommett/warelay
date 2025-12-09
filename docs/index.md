@@ -4,6 +4,8 @@
 
 **CLAWDIS** is a WhatsApp-to-AI gateway that lets your AI assistant live in your pocket. Built for [Clawd](https://clawd.me), a space lobster who needed a TARDIS.
 
+**Source & Issues:** [github.com/steipete/clawdis](https://github.com/steipete/clawdis)
+
 ## What is this?
 
 CLAWDIS (née Warelay) bridges WhatsApp to AI coding agents like [Tau/Pi](https://github.com/badlogic/pi-mono). Send a message, get an AI response. It's like having a genius lobster on call 24/7.
@@ -18,13 +20,15 @@ CLAWDIS (née Warelay) bridges WhatsApp to AI coding agents like [Tau/Pi](https:
 ## Features
 
 - 📱 **WhatsApp Integration** — Uses Baileys for WhatsApp Web protocol
-- 🤖 **AI Agent Gateway** — Spawns coding agents (Tau, Claude, etc.) per message
+- 🤖 **AI Agent Gateway** — Pi/Tau only (Pi CLI in RPC mode)
 - 💬 **Session Management** — Maintains conversation context across messages
 - 🔔 **Heartbeats** — Periodic check-ins so your AI doesn't feel lonely
 - 👥 **Group Chat Support** — Mention-based triggering in group chats
 - 📎 **Media Support** — Send and receive images, audio, documents
 - 🎤 **Voice Messages** — Transcription via Whisper
 - 🔧 **Tool Streaming** — Real-time display of AI tool usage (💻📄✍️📝)
+
+Note: support for Claude, Codex, Gemini, and Opencode has been removed; Pi/Tau is now the only coding agent path.
 
 ## The Name
 
@@ -55,8 +59,10 @@ clawdis status
 
 - [Configuration Guide](./configuration.md) — Setting up your CLAWDIS
 - [Agent Integration](./agents.md) — Connecting AI agents
+- [Direct Agent CLI](./agent-send.md) — Use `clawdis agent` without sending WhatsApp messages
 - [Group Chats](./groups.md) — Mention patterns and filtering
 - [Media Handling](./media.md) — Images, voice, documents
+- [Session Management](./session.md) — How conversations are keyed and reset
 - [Security](./security.md) — Keeping your lobster safe
 - [Troubleshooting](./troubleshooting.md) — When the CLAWDIS misbehaves
 

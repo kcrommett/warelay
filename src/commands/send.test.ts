@@ -1,12 +1,23 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { CliDeps } from "../cli/deps.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { sendCommand } from "./send.js";
 
+const sendViaIpcMock = vi.fn().mockResolvedValue(null);
 vi.mock("../web/ipc.js", () => ({
-  sendViaIpc: vi.fn().mockResolvedValue(null),
+  sendViaIpc: (...args: unknown[]) => sendViaIpcMock(...args),
 }));
+
+const originalTelegramToken = process.env.TELEGRAM_BOT_TOKEN;
+
+beforeEach(() => {
+  process.env.TELEGRAM_BOT_TOKEN = "token-abc";
+});
+
+afterAll(() => {
+  process.env.TELEGRAM_BOT_TOKEN = originalTelegramToken;
+});
 
 const runtime: RuntimeEnv = {
   log: vi.fn(),
@@ -16,134 +27,94 @@ const runtime: RuntimeEnv = {
   }),
 };
 
-const baseDeps = {
-  assertProvider: vi.fn(),
-  sendMessageWeb: vi.fn(),
-  resolveTwilioMediaUrl: vi.fn(),
-  sendMessage: vi.fn(),
-  waitForFinalStatus: vi.fn(),
-} as unknown as CliDeps;
+const makeDeps = (overrides: Partial<CliDeps> = {}): CliDeps => ({
+  sendMessageWhatsApp: vi.fn(),
+  sendMessageTelegram: vi.fn(),
+  ...overrides,
+});
 
 describe("sendCommand", () => {
-  it("validates wait and poll", async () => {
-    await expect(() =>
-      sendCommand(
-        {
-          to: "+1",
-          message: "hi",
-          wait: "-1",
-          poll: "2",
-          provider: "twilio",
-        },
-        baseDeps,
-        runtime,
-      ),
-    ).rejects.toThrow("Wait must be >= 0 seconds");
-
-    await expect(() =>
-      sendCommand(
-        {
-          to: "+1",
-          message: "hi",
-          wait: "0",
-          poll: "0",
-          provider: "twilio",
-        },
-        baseDeps,
-        runtime,
-      ),
-    ).rejects.toThrow("Poll must be > 0 seconds");
-  });
-
-  it("handles web dry-run and warns on wait", async () => {
-    const deps = {
-      ...baseDeps,
-      sendMessageWeb: vi.fn(),
-    } as CliDeps;
+  it("skips send on dry-run", async () => {
+    const deps = makeDeps();
     await sendCommand(
       {
         to: "+1",
         message: "hi",
-        wait: "5",
-        poll: "2",
-        provider: "web",
         dryRun: true,
+      },
+      deps,
+      runtime,
+    );
+    expect(deps.sendMessageWhatsApp).not.toHaveBeenCalled();
+  });
+
+  it("uses IPC when available", async () => {
+    sendViaIpcMock.mockResolvedValueOnce({ success: true, messageId: "ipc1" });
+    const deps = makeDeps();
+    await sendCommand(
+      {
+        to: "+1",
+        message: "hi",
+      },
+      deps,
+      runtime,
+    );
+    expect(deps.sendMessageWhatsApp).not.toHaveBeenCalled();
+    expect(runtime.log).toHaveBeenCalledWith(expect.stringContaining("ipc1"));
+  });
+
+  it("falls back to direct send when IPC fails", async () => {
+    sendViaIpcMock.mockResolvedValueOnce({ success: false, error: "nope" });
+    const deps = makeDeps({
+      sendMessageWhatsApp: vi.fn().mockResolvedValue({ messageId: "direct1" }),
+    });
+    await sendCommand(
+      {
+        to: "+1",
+        message: "hi",
         media: "pic.jpg",
       },
       deps,
       runtime,
     );
-    expect(deps.sendMessageWeb).not.toHaveBeenCalled();
+    expect(deps.sendMessageWhatsApp).toHaveBeenCalled();
   });
 
-  it("sends via web and outputs JSON", async () => {
-    const deps = {
-      ...baseDeps,
-      sendMessageWeb: vi.fn().mockResolvedValue({ messageId: "web1" }),
-    } as CliDeps;
+  it("routes to telegram provider", async () => {
+    const deps = makeDeps({
+      sendMessageTelegram: vi
+        .fn()
+        .mockResolvedValue({ messageId: "t1", chatId: "123" }),
+    });
+    await sendCommand(
+      { to: "123", message: "hi", provider: "telegram" },
+      deps,
+      runtime,
+    );
+    expect(deps.sendMessageTelegram).toHaveBeenCalledWith(
+      "123",
+      "hi",
+      expect.objectContaining({ token: "token-abc" }),
+    );
+    expect(deps.sendMessageWhatsApp).not.toHaveBeenCalled();
+  });
+
+  it("emits json output", async () => {
+    sendViaIpcMock.mockResolvedValueOnce(null);
+    const deps = makeDeps({
+      sendMessageWhatsApp: vi.fn().mockResolvedValue({ messageId: "direct2" }),
+    });
     await sendCommand(
       {
         to: "+1",
         message: "hi",
-        wait: "1",
-        poll: "2",
-        provider: "web",
         json: true,
       },
       deps,
       runtime,
     );
-    expect(deps.sendMessageWeb).toHaveBeenCalled();
     expect(runtime.log).toHaveBeenCalledWith(
       expect.stringContaining('"provider": "web"'),
-    );
-  });
-
-  it("supports twilio dry-run", async () => {
-    const deps = { ...baseDeps } as CliDeps;
-    await sendCommand(
-      {
-        to: "+1",
-        message: "hi",
-        wait: "0",
-        poll: "2",
-        provider: "twilio",
-        dryRun: true,
-      },
-      deps,
-      runtime,
-    );
-    expect(deps.sendMessage).not.toHaveBeenCalled();
-  });
-
-  it("sends via twilio with media and skips wait when zero", async () => {
-    const deps = {
-      ...baseDeps,
-      resolveTwilioMediaUrl: vi.fn().mockResolvedValue("https://media"),
-      sendMessage: vi.fn().mockResolvedValue({ sid: "SM1", client: {} }),
-      waitForFinalStatus: vi.fn(),
-    } as CliDeps;
-    await sendCommand(
-      {
-        to: "+1",
-        message: "hi",
-        wait: "0",
-        poll: "2",
-        provider: "twilio",
-        media: "pic.jpg",
-        serveMedia: true,
-        json: true,
-      },
-      deps,
-      runtime,
-    );
-    expect(deps.resolveTwilioMediaUrl).toHaveBeenCalledWith("pic.jpg", {
-      serveMedia: true,
-      runtime,
-    });
-    expect(deps.waitForFinalStatus).not.toHaveBeenCalled();
-    expect(runtime.log).toHaveBeenCalledWith(
-      expect.stringContaining('"provider": "twilio"'),
     );
   });
 });

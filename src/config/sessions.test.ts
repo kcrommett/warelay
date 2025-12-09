@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { deriveSessionKey } from "./sessions.js";
+import { deriveSessionKey, resolveSessionKey } from "./sessions.js";
 
 describe("sessions", () => {
   it("returns normalized per-sender key", () => {
@@ -18,8 +18,38 @@ describe("sessions", () => {
   });
 
   it("keeps group chats distinct", () => {
+    expect(deriveSessionKey("per-sender", { From: "12345-678@g.us" })).toBe(
+      "group:12345-678@g.us",
+    );
+  });
+
+  it("collapses direct chats to main by default", () => {
+    expect(resolveSessionKey("per-sender", { From: "+1555" })).toBe("main");
+  });
+
+  it("collapses direct chats to main even when sender missing", () => {
+    expect(resolveSessionKey("per-sender", {})).toBe("main");
+  });
+
+  it("maps direct chats to main key when provided", () => {
     expect(
-      deriveSessionKey("per-sender", { From: "12345-678@g.us" }),
+      resolveSessionKey("per-sender", { From: "whatsapp:+1555" }, "main"),
+    ).toBe("main");
+  });
+
+  it("uses custom main key when provided", () => {
+    expect(resolveSessionKey("per-sender", { From: "+1555" }, "primary")).toBe(
+      "primary",
+    );
+  });
+
+  it("keeps global scope untouched", () => {
+    expect(resolveSessionKey("global", { From: "+1555" })).toBe("global");
+  });
+
+  it("leaves groups untouched even with main key", () => {
+    expect(
+      resolveSessionKey("per-sender", { From: "12345-678@g.us" }, "main"),
     ).toBe("group:12345-678@g.us");
   });
 });

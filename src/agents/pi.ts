@@ -141,26 +141,42 @@ export const piSpec: AgentSpec = {
   isInvocation: (argv) => {
     if (argv.length === 0) return false;
     const base = path.basename(argv[0]).replace(/\.(m?js)$/i, "");
-    return base === "pi" || base === "tau";
+    if (base === "pi" || base === "tau") return true;
+
+    // Also handle node entrypoints like `node /.../pi-mono/packages/coding-agent/dist/cli.js`
+    if (base === "node" && argv.length > 1) {
+      const second = argv[1]?.toString().toLowerCase();
+      return (
+        second.includes("pi-mono") &&
+        second.includes("packages") &&
+        second.includes("coding-agent") &&
+        (second.endsWith("cli.js") || second.includes("/dist/cli"))
+      );
+    }
+
+    return false;
   },
   buildArgs: (ctx) => {
     const argv = [...ctx.argv];
+    let bodyPos = ctx.bodyIndex;
     // Non-interactive print + JSON
     if (!argv.includes("-p") && !argv.includes("--print")) {
-      argv.splice(argv.length - 1, 0, "-p");
+      argv.splice(bodyPos, 0, "-p");
+      bodyPos += 1;
     }
     if (
       ctx.format === "json" &&
       !argv.includes("--mode") &&
       !argv.some((a) => a === "--mode")
     ) {
-      argv.splice(argv.length - 1, 0, "--mode", "json");
+      argv.splice(bodyPos, 0, "--mode", "json");
+      bodyPos += 2;
     }
     // Session defaults
     // Identity prefix optional; Pi usually doesn't need it, but allow injection
-    if (!(ctx.sendSystemOnce && ctx.systemSent) && argv[ctx.bodyIndex]) {
-      const existingBody = argv[ctx.bodyIndex];
-      argv[ctx.bodyIndex] = [ctx.identityPrefix, existingBody]
+    if (!(ctx.sendSystemOnce && ctx.systemSent) && argv[bodyPos]) {
+      const existingBody = argv[bodyPos];
+      argv[bodyPos] = [ctx.identityPrefix, existingBody]
         .filter(Boolean)
         .join("\n\n");
     }

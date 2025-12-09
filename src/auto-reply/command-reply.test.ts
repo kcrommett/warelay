@@ -2,10 +2,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { runCommandReply, summarizeClaudeMetadata } from "./command-reply.js";
-import type { ReplyPayload } from "./types.js";
+import * as tauRpc from "../process/tau-rpc.js";
+import { runCommandReply } from "./command-reply.js";
 
 const noopTemplateCtx = {
   Body: "hello",
@@ -13,27 +13,6 @@ const noopTemplateCtx = {
   SessionId: "sess",
   IsNewSession: "true",
 };
-
-type RunnerResult = {
-  stdout?: string;
-  stderr?: string;
-  code?: number;
-  signal?: string | null;
-  killed?: boolean;
-};
-
-function makeRunner(result: RunnerResult, capture: ReplyPayload[] = []) {
-  return vi.fn(async (argv: string[]) => {
-    capture.push({ text: argv.join(" "), argv });
-    return {
-      stdout: result.stdout ?? "",
-      stderr: result.stderr ?? "",
-      code: result.code ?? 0,
-      signal: result.signal ?? null,
-      killed: result.killed ?? false,
-    };
-  });
-}
 
 const enqueueImmediate = vi.fn(
   async <T>(
@@ -45,32 +24,36 @@ const enqueueImmediate = vi.fn(
   },
 );
 
-describe("summarizeClaudeMetadata", () => {
-  it("builds concise meta string", () => {
-    const meta = summarizeClaudeMetadata({
-      duration_ms: 1200,
-      num_turns: 3,
-      total_cost_usd: 0.012345,
-      usage: { server_tool_use: { a: 1, b: 2 } },
-      modelUsage: { "claude-3": 2, haiku: 1 },
-    });
-    expect(meta).toContain("duration=1200ms");
-    expect(meta).toContain("turns=3");
-    expect(meta).toContain("cost=$0.0123");
-    expect(meta).toContain("tool_calls=3");
-    expect(meta).toContain("models=claude-3,haiku");
-  });
+function mockPiRpc(result: {
+  stdout: string;
+  stderr?: string;
+  code: number;
+  signal?: NodeJS.Signals | null;
+  killed?: boolean;
+}) {
+  return vi
+    .spyOn(tauRpc, "runPiRpc")
+    .mockResolvedValue({ killed: false, signal: null, ...result });
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
-describe("runCommandReply", () => {
-  it("injects claude flags and identity prefix", async () => {
-    const captures: ReplyPayload[] = [];
-    const runner = makeRunner({ stdout: "ok" }, captures);
+describe("runCommandReply (pi)", () => {
+  it("injects pi flags and forwards prompt via RPC", async () => {
+    const rpcMock = mockPiRpc({
+      stdout:
+        '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}',
+      stderr: "",
+      code: 0,
+    });
+
     const { payloads } = await runCommandReply({
       reply: {
         mode: "command",
-        command: ["claude", "{{Body}}"],
-        agent: { kind: "claude", format: "json" },
+        command: ["pi", "{{Body}}"],
+        agent: { kind: "pi", format: "json" },
       },
       templatingCtx: noopTemplateCtx,
       sendSystemOnce: false,
@@ -79,100 +62,217 @@ describe("runCommandReply", () => {
       systemSent: false,
       timeoutMs: 1000,
       timeoutSeconds: 1,
-      commandRunner: runner,
+      commandRunner: vi.fn(),
       enqueue: enqueueImmediate,
+      thinkLevel: "medium",
     });
 
     const payload = payloads?.[0];
     expect(payload?.text).toBe("ok");
-    const finalArgv = captures[0].argv as string[];
-    expect(finalArgv).toContain("--output-format");
-    expect(finalArgv).toContain("json");
-    expect(finalArgv).toContain("-p");
-    expect(finalArgv.at(-1)).toContain("You are Clawd (Claude)");
+
+    const call = rpcMock.mock.calls[0]?.[0];
+    expect(call?.prompt).toBe("hello");
+    expect(call?.argv).toContain("-p");
+    expect(call?.argv).toContain("--mode");
+    expect(call?.argv).toContain("rpc");
+    expect(call?.argv).toContain("--thinking");
+    expect(call?.argv).toContain("medium");
   });
 
-  it("omits identity prefix on resumed session when sendSystemOnce=true", async () => {
-    const captures: ReplyPayload[] = [];
-    const runner = makeRunner({ stdout: "ok" }, captures);
-    await runCommandReply({
-      reply: {
-        mode: "command",
-        command: ["claude", "{{Body}}"],
-        agent: { kind: "claude", format: "json" },
-      },
-      templatingCtx: noopTemplateCtx,
-      sendSystemOnce: true,
-      isNewSession: false,
-      isFirstTurnInSession: false,
-      systemSent: true,
-      timeoutMs: 1000,
-      timeoutSeconds: 1,
-      commandRunner: runner,
-      enqueue: enqueueImmediate,
+  it("sends the body via RPC even when the command omits {{Body}}", async () => {
+    const rpcMock = mockPiRpc({
+      stdout:
+        '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}',
+      stderr: "",
+      code: 0,
     });
-    const finalArgv = captures[0].argv as string[];
-    expect(finalArgv.at(-1)).not.toContain("You are Clawd (Claude)");
-  });
 
-  it("prepends identity on first turn when sendSystemOnce=true", async () => {
-    const captures: ReplyPayload[] = [];
-    const runner = makeRunner({ stdout: "ok" }, captures);
     await runCommandReply({
       reply: {
         mode: "command",
-        command: ["claude", "{{Body}}"],
-        agent: { kind: "claude", format: "json" },
+        command: ["pi", "--mode", "rpc", "--session", "/tmp/demo.jsonl"],
+        agent: { kind: "pi" },
       },
       templatingCtx: noopTemplateCtx,
-      sendSystemOnce: true,
+      sendSystemOnce: false,
       isNewSession: true,
       isFirstTurnInSession: true,
       systemSent: false,
       timeoutMs: 1000,
       timeoutSeconds: 1,
-      commandRunner: runner,
+      commandRunner: vi.fn(),
       enqueue: enqueueImmediate,
     });
-    const finalArgv = captures[0].argv as string[];
-    expect(finalArgv.at(-1)).toContain("You are Clawd (Claude)");
+
+    const call = rpcMock.mock.calls[0]?.[0];
+    expect(call?.prompt).toBe("hello");
+    expect(
+      (call?.argv ?? []).some((arg: string) => arg.includes("hello")),
+    ).toBe(false);
   });
 
-  it("still prepends identity if resume session but systemSent=false", async () => {
-    const captures: ReplyPayload[] = [];
-    const runner = makeRunner({ stdout: "ok" }, captures);
-    await runCommandReply({
+  it("does not echo the user's prompt when the agent returns no assistant text", async () => {
+    const rpcMock = mockPiRpc({
+      stdout: [
+        '{"type":"agent_start"}',
+        '{"type":"turn_start"}',
+        '{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}',
+        '{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}',
+        // assistant emits nothing useful
+        '{"type":"agent_end"}',
+      ].join("\n"),
+      stderr: "",
+      code: 0,
+    });
+
+    const { payloads } = await runCommandReply({
       reply: {
         mode: "command",
-        command: ["claude", "{{Body}}"],
-        agent: { kind: "claude", format: "json" },
+        command: ["pi", "{{Body}}"],
+        agent: { kind: "pi" },
       },
-      templatingCtx: noopTemplateCtx,
-      sendSystemOnce: true,
-      isNewSession: false,
-      isFirstTurnInSession: false,
+      templatingCtx: {
+        ...noopTemplateCtx,
+        Body: "hello",
+        BodyStripped: "hello",
+      },
+      sendSystemOnce: false,
+      isNewSession: true,
+      isFirstTurnInSession: true,
       systemSent: false,
       timeoutMs: 1000,
       timeoutSeconds: 1,
-      commandRunner: runner,
+      commandRunner: vi.fn(),
       enqueue: enqueueImmediate,
     });
-    const finalArgv = captures[0].argv as string[];
-    expect(finalArgv.at(-1)).toContain("You are Clawd (Claude)");
+
+    expect(rpcMock).toHaveBeenCalledOnce();
+    expect(payloads?.length).toBe(1);
+    expect(payloads?.[0]?.text).toMatch(/no output/i);
+    expect(payloads?.[0]?.text).not.toContain("hello");
   });
 
-  it("picks session resume args when not new", async () => {
-    const captures: ReplyPayload[] = [];
-    const runner = makeRunner({ stdout: "hi" }, captures);
+  it("does not echo the prompt even when the fallback text matches after stripping prefixes", async () => {
+    const rpcMock = mockPiRpc({
+      stdout: [
+        '{"type":"agent_start"}',
+        '{"type":"turn_start"}',
+        '{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"[Dec 5 22:52] https://example.com"}]}}',
+        '{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"[Dec 5 22:52] https://example.com"}]}}',
+        // No assistant content
+        '{"type":"agent_end"}',
+      ].join("\n"),
+      stderr: "",
+      code: 0,
+    });
+
+    const { payloads } = await runCommandReply({
+      reply: {
+        mode: "command",
+        command: ["pi", "{{Body}}"],
+        agent: { kind: "pi" },
+      },
+      templatingCtx: {
+        ...noopTemplateCtx,
+        Body: "[Dec 5 22:52] https://example.com",
+        BodyStripped: "[Dec 5 22:52] https://example.com",
+      },
+      sendSystemOnce: false,
+      isNewSession: true,
+      isFirstTurnInSession: true,
+      systemSent: false,
+      timeoutMs: 1000,
+      timeoutSeconds: 1,
+      commandRunner: vi.fn(),
+      enqueue: enqueueImmediate,
+    });
+
+    expect(rpcMock).toHaveBeenCalledOnce();
+    expect(payloads?.length).toBe(1);
+    expect(payloads?.[0]?.text).toMatch(/no output/i);
+    expect(payloads?.[0]?.text).not.toContain("example.com");
+  });
+
+  it("forwards tool events even when verbose is off", async () => {
+    const events: Array<{ stream: string; data: Record<string, unknown> }> = [];
+
+    vi.spyOn(tauRpc, "runPiRpc").mockImplementation(
+      async (opts: Parameters<typeof tauRpc.runPiRpc>[0]) => {
+        opts.onEvent?.(
+          JSON.stringify({
+            type: "tool_execution_start",
+            toolName: "bash",
+            toolCallId: "call-1",
+            args: { cmd: "echo 1" },
+          }),
+        );
+        opts.onEvent?.(
+          JSON.stringify({
+            type: "message",
+            message: {
+              role: "tool_result",
+              toolCallId: "call-1",
+              content: [{ type: "text", text: "ok" }],
+            },
+          }),
+        );
+        return {
+          stdout:
+            '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}',
+          stderr: "",
+          code: 0,
+          killed: false,
+          signal: null,
+        };
+      },
+    );
+
     await runCommandReply({
       reply: {
         mode: "command",
-        command: ["cli", "{{Body}}"],
-        agent: { kind: "claude" },
-        session: {
-          sessionArgNew: ["--new", "{{SessionId}}"],
-          sessionArgResume: ["--resume", "{{SessionId}}"],
-        },
+        command: ["pi", "{{Body}}"],
+        agent: { kind: "pi" },
+      },
+      templatingCtx: noopTemplateCtx,
+      sendSystemOnce: false,
+      isNewSession: true,
+      isFirstTurnInSession: true,
+      systemSent: false,
+      timeoutMs: 1000,
+      timeoutSeconds: 1,
+      commandRunner: vi.fn(),
+      enqueue: enqueueImmediate,
+      onAgentEvent: (evt) => events.push(evt),
+    });
+
+    expect(events).toContainEqual({
+      stream: "tool",
+      data: expect.objectContaining({
+        phase: "start",
+        name: "bash",
+        toolCallId: "call-1",
+      }),
+    });
+    expect(events).toContainEqual({
+      stream: "tool",
+      data: expect.objectContaining({ phase: "result", toolCallId: "call-1" }),
+    });
+  });
+
+  it("adds session args and --continue when resuming", async () => {
+    const rpcMock = mockPiRpc({
+      stdout:
+        '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}',
+      stderr: "",
+      code: 0,
+    });
+
+    await runCommandReply({
+      reply: {
+        mode: "command",
+        command: ["pi", "{{Body}}"],
+        agent: { kind: "pi" },
+        session: {},
       },
       templatingCtx: { ...noopTemplateCtx, SessionId: "abc" },
       sendSystemOnce: true,
@@ -181,23 +281,28 @@ describe("runCommandReply", () => {
       systemSent: true,
       timeoutMs: 1000,
       timeoutSeconds: 1,
-      commandRunner: runner,
+      commandRunner: vi.fn(),
       enqueue: enqueueImmediate,
     });
-    const argv = captures[0].argv as string[];
-    expect(argv).toContain("--resume");
-    expect(argv).toContain("abc");
+
+    const argv = rpcMock.mock.calls[0]?.[0]?.argv ?? [];
+    expect(argv).toContain("--session");
+    expect(argv.some((a) => a.includes("abc"))).toBe(true);
+    expect(argv).toContain("--continue");
   });
 
   it("returns timeout text with partial snippet", async () => {
-    const runner = vi.fn(async () => {
-      throw { stdout: "partial output here", killed: true, signal: "SIGKILL" };
+    vi.spyOn(tauRpc, "runPiRpc").mockRejectedValue({
+      stdout: "partial output here",
+      killed: true,
+      signal: "SIGKILL",
     });
+
     const { payloads, meta } = await runCommandReply({
       reply: {
         mode: "command",
-        command: ["echo", "hi"],
-        agent: { kind: "claude" },
+        command: ["pi", "hi"],
+        agent: { kind: "pi" },
       },
       templatingCtx: noopTemplateCtx,
       sendSystemOnce: false,
@@ -206,53 +311,31 @@ describe("runCommandReply", () => {
       systemSent: false,
       timeoutMs: 10,
       timeoutSeconds: 1,
-      commandRunner: runner,
+      commandRunner: vi.fn(),
       enqueue: enqueueImmediate,
     });
+
     const payload = payloads?.[0];
     expect(payload?.text).toContain("Command timed out after 1s");
     expect(payload?.text).toContain("partial output");
     expect(meta.killed).toBe(true);
   });
 
-  it("includes cwd hint in timeout message", async () => {
-    const runner = vi.fn(async () => {
-      throw { stdout: "", killed: true, signal: "SIGKILL" };
+  it("collapses rpc deltas instead of emitting raw JSON spam", async () => {
+    mockPiRpc({
+      stdout: [
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Hello"}}',
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" world"}}',
+      ].join("\n"),
+      stderr: "",
+      code: 0,
     });
-    const { payloads } = await runCommandReply({
-      reply: {
-        mode: "command",
-        command: ["echo", "hi"],
-        cwd: "/tmp/work",
-        agent: { kind: "claude" },
-      },
-      templatingCtx: noopTemplateCtx,
-      sendSystemOnce: false,
-      isNewSession: true,
-      isFirstTurnInSession: true,
-      systemSent: false,
-      timeoutMs: 5,
-      timeoutSeconds: 1,
-      commandRunner: runner,
-      enqueue: enqueueImmediate,
-    });
-    const payload = payloads?.[0];
-    expect(payload?.text).toContain("(cwd: /tmp/work)");
-  });
 
-  it("parses MEDIA tokens and respects mediaMaxMb for local files", async () => {
-    const tmp = path.join(os.tmpdir(), `warelay-test-${Date.now()}.bin`);
-    const bigBuffer = Buffer.alloc(2 * 1024 * 1024, 1);
-    await fs.writeFile(tmp, bigBuffer);
-    const runner = makeRunner({
-      stdout: `hi\nMEDIA:${tmp}\nMEDIA:https://example.com/img.jpg`,
-    });
     const { payloads } = await runCommandReply({
       reply: {
         mode: "command",
-        command: ["echo", "hi"],
-        mediaMaxMb: 1,
-        agent: { kind: "claude" },
+        command: ["pi", "{{Body}}"],
+        agent: { kind: "pi" },
       },
       templatingCtx: noopTemplateCtx,
       sendSystemOnce: false,
@@ -261,46 +344,129 @@ describe("runCommandReply", () => {
       systemSent: false,
       timeoutMs: 1000,
       timeoutSeconds: 1,
-      commandRunner: runner,
+      commandRunner: vi.fn(),
       enqueue: enqueueImmediate,
     });
+
+    expect(payloads?.[0]?.text).toBe("Hello world");
+  });
+
+  it("falls back to assistant text when parseOutput yields nothing", async () => {
+    mockPiRpc({
+      stdout: [
+        '{"type":"agent_start"}',
+        '{"type":"turn_start"}',
+        '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Acknowledged."}]}}',
+      ].join("\n"),
+      stderr: "",
+      code: 0,
+    });
+    // Force parser to return nothing so we exercise fallback.
+    const parseSpy = vi
+      .spyOn((await import("../agents/pi.js")).piSpec, "parseOutput")
+      .mockReturnValue({ texts: [], toolResults: [], meta: undefined });
+
+    const { payloads } = await runCommandReply({
+      reply: {
+        mode: "command",
+        command: ["pi", "{{Body}}"],
+        agent: { kind: "pi" },
+      },
+      templatingCtx: noopTemplateCtx,
+      sendSystemOnce: false,
+      isNewSession: true,
+      isFirstTurnInSession: true,
+      systemSent: false,
+      timeoutMs: 1000,
+      timeoutSeconds: 1,
+      commandRunner: vi.fn(),
+      enqueue: enqueueImmediate,
+    });
+
+    parseSpy.mockRestore();
+    expect(payloads?.[0]?.text).toBe("Acknowledged.");
+  });
+
+  it("does not stream tool results when verbose is off", async () => {
+    const onPartial = vi.fn();
+    mockPiRpc({
+      stdout: [
+        '{"type":"tool_execution_start","toolName":"bash","args":{"command":"ls"}}',
+        '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}',
+      ].join("\n"),
+      stderr: "",
+      code: 0,
+    });
+
+    await runCommandReply({
+      reply: {
+        mode: "command",
+        command: ["pi", "{{Body}}"],
+        agent: { kind: "pi" },
+      },
+      templatingCtx: noopTemplateCtx,
+      sendSystemOnce: false,
+      isNewSession: true,
+      isFirstTurnInSession: true,
+      systemSent: false,
+      timeoutMs: 1000,
+      timeoutSeconds: 1,
+      commandRunner: vi.fn(),
+      enqueue: enqueueImmediate,
+      onPartialReply: onPartial,
+      verboseLevel: "off",
+    });
+
+    expect(onPartial).not.toHaveBeenCalled();
+  });
+
+  it("parses MEDIA tokens and respects mediaMaxMb for local files", async () => {
+    const tmp = path.join(os.tmpdir(), `clawdis-test-${Date.now()}.bin`);
+    const bigBuffer = Buffer.alloc(2 * 1024 * 1024, 1);
+    await fs.writeFile(tmp, bigBuffer);
+
+    mockPiRpc({
+      stdout: `hi\nMEDIA:${tmp}\nMEDIA:https://example.com/img.jpg`,
+      stderr: "",
+      code: 0,
+    });
+
+    const { payloads } = await runCommandReply({
+      reply: {
+        mode: "command",
+        command: ["pi", "hi"],
+        mediaMaxMb: 1,
+        agent: { kind: "pi" },
+      },
+      templatingCtx: noopTemplateCtx,
+      sendSystemOnce: false,
+      isNewSession: true,
+      isFirstTurnInSession: true,
+      systemSent: false,
+      timeoutMs: 1000,
+      timeoutSeconds: 1,
+      commandRunner: vi.fn(),
+      enqueue: enqueueImmediate,
+    });
+
     const payload = payloads?.[0];
     expect(payload?.mediaUrls).toEqual(["https://example.com/img.jpg"]);
     await fs.unlink(tmp);
   });
 
-  it("emits Claude metadata", async () => {
-    const runner = makeRunner({
+  it("captures queue wait metrics and agent meta", async () => {
+    mockPiRpc({
       stdout:
-        '{"text":"hi","duration_ms":50,"total_cost_usd":0.0001,"usage":{"server_tool_use":{"a":1}}}',
+        '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input":10,"output":5}}}',
+      stderr: "",
+      code: 0,
     });
-    const { meta } = await runCommandReply({
-      reply: {
-        mode: "command",
-        command: ["claude", "{{Body}}"],
-        agent: { kind: "claude", format: "json" },
-      },
-      templatingCtx: noopTemplateCtx,
-      sendSystemOnce: false,
-      isNewSession: true,
-      isFirstTurnInSession: true,
-      systemSent: false,
-      timeoutMs: 1000,
-      timeoutSeconds: 1,
-      commandRunner: runner,
-      enqueue: enqueueImmediate,
-    });
-    expect(meta.agentMeta?.extra?.summary).toContain("duration=50ms");
-    expect(meta.agentMeta?.extra?.summary).toContain("tool_calls=1");
-  });
 
-  it("captures queue wait metrics in meta", async () => {
-    const runner = makeRunner({ stdout: "ok" });
     const { meta } = await runCommandReply({
       reply: {
         mode: "command",
-        command: ["echo", "{{Body}}"],
-        agent: { kind: "claude" },
+        command: ["pi", "{{Body}}"],
+        agent: { kind: "pi" },
       },
       templatingCtx: noopTemplateCtx,
       sendSystemOnce: false,
@@ -309,88 +475,12 @@ describe("runCommandReply", () => {
       systemSent: false,
       timeoutMs: 100,
       timeoutSeconds: 1,
-      commandRunner: runner,
+      commandRunner: vi.fn(),
       enqueue: enqueueImmediate,
     });
+
     expect(meta.queuedMs).toBe(25);
     expect(meta.queuedAhead).toBe(2);
-  });
-
-  it("handles empty result string without dumping raw JSON", async () => {
-    // Bug fix: Claude CLI returning {"result": ""} should not send raw JSON to WhatsApp
-    // The fix changed from truthy check to explicit typeof check
-    const runner = makeRunner({
-      stdout: '{"result":"","duration_ms":50,"total_cost_usd":0.001}',
-    });
-    const { payloads } = await runCommandReply({
-      reply: {
-        mode: "command",
-        command: ["claude", "{{Body}}"],
-        agent: { kind: "claude", format: "json" },
-      },
-      templatingCtx: noopTemplateCtx,
-      sendSystemOnce: false,
-      isNewSession: true,
-      isFirstTurnInSession: true,
-      systemSent: false,
-      timeoutMs: 1000,
-      timeoutSeconds: 1,
-      commandRunner: runner,
-      enqueue: enqueueImmediate,
-    });
-    // Should NOT contain raw JSON - empty result should produce fallback message
-    const payload = payloads?.[0];
-    expect(payload?.text).not.toContain('{"result"');
-    expect(payload?.text).toContain("command produced no output");
-  });
-
-  it("handles empty text string in Claude JSON", async () => {
-    const runner = makeRunner({
-      stdout: '{"text":"","duration_ms":50}',
-    });
-    const { payloads } = await runCommandReply({
-      reply: {
-        mode: "command",
-        command: ["claude", "{{Body}}"],
-        agent: { kind: "claude", format: "json" },
-      },
-      templatingCtx: noopTemplateCtx,
-      sendSystemOnce: false,
-      isNewSession: true,
-      isFirstTurnInSession: true,
-      systemSent: false,
-      timeoutMs: 1000,
-      timeoutSeconds: 1,
-      commandRunner: runner,
-      enqueue: enqueueImmediate,
-    });
-    // Empty text should produce fallback message, not raw JSON
-    const payload = payloads?.[0];
-    expect(payload?.text).not.toContain('{"text"');
-    expect(payload?.text).toContain("command produced no output");
-  });
-
-  it("returns actual text when result is non-empty", async () => {
-    const runner = makeRunner({
-      stdout: '{"result":"hello world","duration_ms":50}',
-    });
-    const { payloads } = await runCommandReply({
-      reply: {
-        mode: "command",
-        command: ["claude", "{{Body}}"],
-        agent: { kind: "claude", format: "json" },
-      },
-      templatingCtx: noopTemplateCtx,
-      sendSystemOnce: false,
-      isNewSession: true,
-      isFirstTurnInSession: true,
-      systemSent: false,
-      timeoutMs: 1000,
-      timeoutSeconds: 1,
-      commandRunner: runner,
-      enqueue: enqueueImmediate,
-    });
-    const payload = payloads?.[0];
-    expect(payload?.text).toBe("hello world");
+    expect((meta.agentMeta?.usage as { output?: number })?.output).toBe(5);
   });
 });

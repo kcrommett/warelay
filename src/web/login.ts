@@ -14,9 +14,13 @@ import {
 
 export async function loginWeb(
   verbose: boolean,
+  provider = "whatsapp",
   waitForConnection: typeof waitForWaConnection = waitForWaConnection,
   runtime: RuntimeEnv = defaultRuntime,
 ) {
+  if (provider !== "whatsapp" && provider !== "web") {
+    throw new Error(`Unsupported provider: ${provider}`);
+  }
   const sock = await createWaSocket(true, verbose);
   logInfo("Waiting for WhatsApp connection...", runtime);
   try {
@@ -55,7 +59,7 @@ export async function loginWeb(
       await fs.rm(WA_WEB_AUTH_DIR, { recursive: true, force: true });
       console.error(
         danger(
-          "WhatsApp reported the session is logged out. Cleared cached web session; please rerun warelay login and scan the QR again.",
+          "WhatsApp reported the session is logged out. Cleared cached web session; please rerun clawdis login and scan the QR again.",
         ),
       );
       throw new Error("Session logged out; cache cleared. Re-run login.");

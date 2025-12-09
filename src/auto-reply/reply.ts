@@ -1,76 +1,51 @@
 import crypto from "node:crypto";
-import type { MessageInstance } from "twilio/lib/rest/api/v2010/account/message.js";
+
+import { lookupContextTokens } from "../agents/context.js";
+import { DEFAULT_CONTEXT_TOKENS, DEFAULT_MODEL } from "../agents/defaults.js";
+import { resolveBundledPiBinary } from "../agents/pi-path.js";
 import { loadConfig, type WarelayConfig } from "../config/config.js";
 import {
   DEFAULT_IDLE_MINUTES,
   DEFAULT_RESET_TRIGGER,
-  deriveSessionKey,
   loadSessionStore,
+  resolveSessionKey,
   resolveStorePath,
   type SessionEntry,
   saveSessionStore,
 } from "../config/sessions.js";
-import { info, isVerbose, logVerbose } from "../globals.js";
-import { ensureMediaHosted } from "../media/host.js";
-import { runCommandWithTimeout } from "../process/exec.js";
-import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
-import type { TwilioRequester } from "../twilio/types.js";
-import { sendTypingIndicator } from "../twilio/typing.js";
+import { isVerbose, logVerbose } from "../globals.js";
+import { buildProviderSummary } from "../infra/provider-summary.js";
 import { triggerWarelayRestart } from "../infra/restart.js";
-import { chunkText } from "./chunk.js";
+import { drainSystemEvents } from "../infra/system-events.js";
+import { runCommandWithTimeout } from "../process/exec.js";
+import { defaultRuntime } from "../runtime.js";
+import { resolveHeartbeatSeconds } from "../web/reconnect.js";
+import { getWebAuthAgeMs, webAuthExists } from "../web/session.js";
 import { runCommandReply } from "./command-reply.js";
+import { buildStatusMessage } from "./status.js";
 import {
   applyTemplate,
   type MsgContext,
   type TemplateContext,
 } from "./templating.js";
+import {
+  normalizeThinkLevel,
+  normalizeVerboseLevel,
+  type ThinkLevel,
+  type VerboseLevel,
+} from "./thinking.js";
 import { isAudio, transcribeInboundAudio } from "./transcription.js";
 import type { GetReplyOptions, ReplyPayload } from "./types.js";
 
 export type { GetReplyOptions, ReplyPayload } from "./types.js";
 
-const TWILIO_TEXT_LIMIT = 1600;
-
 const ABORT_TRIGGERS = new Set(["stop", "esc", "abort", "wait", "exit"]);
 const ABORT_MEMORY = new Map<string, boolean>();
+const SYSTEM_MARK = "⚙️";
 
-type ThinkLevel = "off" | "minimal" | "low" | "medium" | "high";
-type VerboseLevel = "off" | "on";
+type ReplyConfig = NonNullable<WarelayConfig["inbound"]>["reply"];
 
-function normalizeThinkLevel(raw?: string | null): ThinkLevel | undefined {
-  if (!raw) return undefined;
-  const key = raw.toLowerCase();
-  if (["off"].includes(key)) return "off";
-  if (["min", "minimal"].includes(key)) return "minimal";
-  if (["low", "thinkhard", "think-hard", "think_hard"].includes(key))
-    return "low";
-  if (["med", "medium", "thinkharder", "think-harder", "harder"].includes(key))
-    return "medium";
-  if (
-    [
-      "high",
-      "ultra",
-      "ultrathink",
-      "think-hard",
-      "thinkhardest",
-      "highest",
-      "max",
-    ].includes(key)
-  )
-    return "high";
-  if (["think"].includes(key)) return "minimal";
-  return undefined;
-}
-
-function normalizeVerboseLevel(raw?: string | null): VerboseLevel | undefined {
-  if (!raw) return undefined;
-  const key = raw.toLowerCase();
-  if (["off", "false", "no", "0"].includes(key)) return "off";
-  if (["on", "full", "true", "yes", "1"].includes(key)) return "on";
-  return undefined;
-}
-
-function extractThinkDirective(body?: string): {
+export function extractThinkDirective(body?: string): {
   cleaned: string;
   thinkLevel?: ThinkLevel;
   rawLevel?: string;
@@ -78,7 +53,9 @@ function extractThinkDirective(body?: string): {
 } {
   if (!body) return { cleaned: "", hasDirective: false };
   // Match the longest keyword first to avoid partial captures (e.g. "/think:high")
-  const match = body.match(/\/(?:thinking|think|t)\s*:?\s*([a-zA-Z-]+)\b/i);
+  const match = body.match(
+    /(?:^|\s)\/(?:thinking|think|t)\s*:?\s*([a-zA-Z-]+)\b/i,
+  );
   const thinkLevel = normalizeThinkLevel(match?.[1]);
   const cleaned = match
     ? body.replace(match[0], "").replace(/\s+/g, " ").trim()
@@ -91,14 +68,16 @@ function extractThinkDirective(body?: string): {
   };
 }
 
-function extractVerboseDirective(body?: string): {
+export function extractVerboseDirective(body?: string): {
   cleaned: string;
   verboseLevel?: VerboseLevel;
   rawLevel?: string;
   hasDirective: boolean;
 } {
   if (!body) return { cleaned: "", hasDirective: false };
-  const match = body.match(/\/(?:verbose|v)\s*:?\s*([a-zA-Z-]+)\b/i);
+  const match = body.match(
+    /(?:^|\s)\/(?:verbose|v)(?=$|\s|:)\s*:?\s*([a-zA-Z-]+)\b/i,
+  );
   const verboseLevel = normalizeVerboseLevel(match?.[1]);
   const cleaned = match
     ? body.replace(match[0], "").replace(/\s+/g, " ").trim()
@@ -131,6 +110,55 @@ function stripStructuralPrefixes(text: string): string {
     .trim();
 }
 
+function stripMentions(
+  text: string,
+  ctx: MsgContext,
+  cfg: WarelayConfig | undefined,
+): string {
+  let result = text;
+  const patterns = cfg?.inbound?.groupChat?.mentionPatterns ?? [];
+  for (const p of patterns) {
+    try {
+      const re = new RegExp(p, "gi");
+      result = result.replace(re, " ");
+    } catch {
+      // ignore invalid regex
+    }
+  }
+  const selfE164 = (ctx.To ?? "").replace(/^whatsapp:/, "");
+  if (selfE164) {
+    const esc = selfE164.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    result = result
+      .replace(new RegExp(esc, "gi"), " ")
+      .replace(new RegExp(`@${esc}`, "gi"), " ");
+  }
+  // Generic mention patterns like @123456789 or plain digits
+  result = result.replace(/@[0-9+]{5,}/g, " ");
+  return result.replace(/\s+/g, " ").trim();
+}
+
+function makeDefaultPiReply(): ReplyConfig {
+  const piBin = resolveBundledPiBinary() ?? "pi";
+  const defaultContext =
+    lookupContextTokens(DEFAULT_MODEL) ?? DEFAULT_CONTEXT_TOKENS;
+  return {
+    mode: "command" as const,
+    command: [piBin, "--mode", "rpc", "{{BodyStripped}}"],
+    agent: {
+      kind: "pi" as const,
+      model: DEFAULT_MODEL,
+      contextTokens: defaultContext,
+      format: "json" as const,
+    },
+    session: {
+      scope: "per-sender" as const,
+      resetTriggers: [DEFAULT_RESET_TRIGGER],
+      idleMinutes: DEFAULT_IDLE_MINUTES,
+    },
+    timeoutSeconds: 600,
+  };
+}
+
 export async function getReplyFromConfig(
   ctx: MsgContext,
   opts?: GetReplyOptions,
@@ -139,7 +167,7 @@ export async function getReplyFromConfig(
 ): Promise<ReplyPayload | ReplyPayload[] | undefined> {
   // Choose reply from config: static text or external command stdout.
   const cfg = configOverride ?? loadConfig();
-  const reply = cfg.inbound?.reply;
+  const reply: ReplyConfig = cfg.inbound?.reply ?? makeDefaultPiReply();
   const timeoutSeconds = Math.max(reply?.timeoutSeconds ?? 600, 1);
   const timeoutMs = timeoutSeconds * 1000;
   let started = false;
@@ -188,6 +216,7 @@ export async function getReplyFromConfig(
 
   // Optional session handling (conversation reuse + /new resets)
   const sessionCfg = reply?.session;
+  const mainKey = sessionCfg?.mainKey ?? "main";
   const resetTriggers = sessionCfg?.resetTriggers?.length
     ? sessionCfg.resetTriggers
     : [DEFAULT_RESET_TRIGGER];
@@ -210,24 +239,36 @@ export async function getReplyFromConfig(
   let persistedThinking: string | undefined;
   let persistedVerbose: string | undefined;
 
+  const triggerBodyNormalized = stripStructuralPrefixes(ctx.Body ?? "")
+    .trim()
+    .toLowerCase();
+
   if (sessionCfg) {
-    const trimmedBody = (ctx.Body ?? "").trim();
+    const rawBody = ctx.Body ?? "";
+    const trimmedBody = rawBody.trim();
+    // Timestamp/message prefixes (e.g. "[Dec 4 17:35] ") are added by the
+    // web inbox before we get here. They prevented reset triggers like "/new"
+    // from matching, so strip structural wrappers when checking for resets.
+    const strippedForReset = triggerBodyNormalized;
     for (const trigger of resetTriggers) {
       if (!trigger) continue;
-      if (trimmedBody === trigger) {
+      if (trimmedBody === trigger || strippedForReset === trigger) {
         isNewSession = true;
         bodyStripped = "";
         break;
       }
       const triggerPrefix = `${trigger} `;
-      if (trimmedBody.startsWith(triggerPrefix)) {
+      if (
+        trimmedBody.startsWith(triggerPrefix) ||
+        strippedForReset.startsWith(triggerPrefix)
+      ) {
         isNewSession = true;
-        bodyStripped = trimmedBody.slice(trigger.length).trimStart();
+        bodyStripped = strippedForReset.slice(trigger.length).trimStart();
         break;
       }
     }
 
-    sessionKey = deriveSessionKey(sessionScope, ctx);
+    sessionKey = resolveSessionKey(sessionScope, ctx, mainKey);
     sessionStore = loadSessionStore(storePath);
     const entry = sessionStore[sessionKey];
     const idleMs = idleMinutes * 60_000;
@@ -246,13 +287,16 @@ export async function getReplyFromConfig(
       abortedLastRun = false;
     }
 
+    const baseEntry = !isNewSession && freshEntry ? entry : undefined;
     sessionEntry = {
+      ...baseEntry,
       sessionId,
       updatedAt: Date.now(),
       systemSent,
       abortedLastRun,
-      thinkingLevel: persistedThinking,
-      verboseLevel: persistedVerbose,
+      // Persist previously stored thinking/verbose levels when present.
+      thinkingLevel: persistedThinking ?? baseEntry?.thinkingLevel,
+      verboseLevel: persistedVerbose ?? baseEntry?.verboseLevel,
     };
     sessionStore[sessionKey] = sessionEntry;
     await saveSessionStore(storePath, sessionStore);
@@ -280,6 +324,10 @@ export async function getReplyFromConfig(
   sessionCtx.Body = verboseCleaned;
   sessionCtx.BodyStripped = verboseCleaned;
 
+  const isGroup =
+    typeof ctx.From === "string" &&
+    (ctx.From.includes("@g.us") || ctx.From.startsWith("group:"));
+
   let resolvedThinkLevel =
     inlineThink ??
     (sessionEntry?.thinkingLevel as ThinkLevel | undefined) ??
@@ -290,15 +338,26 @@ export async function getReplyFromConfig(
     (sessionEntry?.verboseLevel as VerboseLevel | undefined) ??
     (reply?.verboseDefault as VerboseLevel | undefined);
 
+  const combinedDirectiveOnly =
+    hasThinkDirective &&
+    hasVerboseDirective &&
+    (() => {
+      const stripped = stripStructuralPrefixes(verboseCleaned ?? "");
+      const noMentions = isGroup ? stripMentions(stripped, ctx, cfg) : stripped;
+      return noMentions.length === 0;
+    })();
+
   const directiveOnly = (() => {
     if (!hasThinkDirective) return false;
     if (!thinkCleaned) return true;
-    const stripped = stripStructuralPrefixes(thinkCleaned);
-    return stripped.length === 0;
+    // Check after stripping both think and verbose so combined directives count.
+    const stripped = stripStructuralPrefixes(verboseCleaned);
+    const noMentions = isGroup ? stripMentions(stripped, ctx, cfg) : stripped;
+    return noMentions.length === 0;
   })();
 
   // Directive-only message => persist session thinking level and return ack
-  if (directiveOnly) {
+  if (directiveOnly || combinedDirectiveOnly) {
     if (!inlineThink) {
       cleanupTyping();
       return {
@@ -315,10 +374,43 @@ export async function getReplyFromConfig(
       sessionStore[sessionKey] = sessionEntry;
       await saveSessionStore(storePath, sessionStore);
     }
-    const ack =
-      inlineThink === "off"
-        ? "Thinking disabled."
-        : `Thinking level set to ${inlineThink}.`;
+    // If verbose directive is also present, persist it too.
+    if (
+      hasVerboseDirective &&
+      inlineVerbose &&
+      sessionEntry &&
+      sessionStore &&
+      sessionKey
+    ) {
+      if (inlineVerbose === "off") {
+        delete sessionEntry.verboseLevel;
+      } else {
+        sessionEntry.verboseLevel = inlineVerbose;
+      }
+      sessionEntry.updatedAt = Date.now();
+      sessionStore[sessionKey] = sessionEntry;
+      await saveSessionStore(storePath, sessionStore);
+    }
+    const parts: string[] = [];
+    if (inlineThink === "off") {
+      parts.push("Thinking disabled.");
+    } else {
+      parts.push(`Thinking level set to ${inlineThink}.`);
+    }
+    if (hasVerboseDirective) {
+      if (!inlineVerbose) {
+        parts.push(
+          `Unrecognized verbose level "${rawVerboseLevel ?? ""}". Valid levels: off, on.`,
+        );
+      } else {
+        parts.push(
+          inlineVerbose === "off"
+            ? "Verbose logging disabled."
+            : "Verbose logging enabled.",
+        );
+      }
+    }
+    const ack = parts.join(" ");
     cleanupTyping();
     return { text: ack };
   }
@@ -327,7 +419,8 @@ export async function getReplyFromConfig(
     if (!hasVerboseDirective) return false;
     if (!verboseCleaned) return true;
     const stripped = stripStructuralPrefixes(verboseCleaned);
-    return stripped.length === 0;
+    const noMentions = isGroup ? stripMentions(stripped, ctx, cfg) : stripped;
+    return noMentions.length === 0;
   })();
 
   if (verboseDirectiveOnly) {
@@ -349,10 +442,36 @@ export async function getReplyFromConfig(
     }
     const ack =
       inlineVerbose === "off"
-        ? "Verbose logging disabled."
-        : "Verbose logging enabled.";
+        ? `${SYSTEM_MARK} Verbose logging disabled.`
+        : `${SYSTEM_MARK} Verbose logging enabled.`;
     cleanupTyping();
     return { text: ack };
+  }
+
+  // Persist inline think/verbose settings even when additional content follows.
+  if (sessionEntry && sessionStore && sessionKey) {
+    let updated = false;
+    if (hasThinkDirective && inlineThink) {
+      if (inlineThink === "off") {
+        delete sessionEntry.thinkingLevel;
+      } else {
+        sessionEntry.thinkingLevel = inlineThink;
+      }
+      updated = true;
+    }
+    if (hasVerboseDirective && inlineVerbose) {
+      if (inlineVerbose === "off") {
+        delete sessionEntry.verboseLevel;
+      } else {
+        sessionEntry.verboseLevel = inlineVerbose;
+      }
+      updated = true;
+    }
+    if (updated) {
+      sessionEntry.updatedAt = Date.now();
+      sessionStore[sessionKey] = sessionEntry;
+      await saveSessionStore(storePath, sessionStore);
+    }
   }
 
   // Optional allowlist by origin number (E.164 without whatsapp: prefix)
@@ -360,15 +479,8 @@ export async function getReplyFromConfig(
   const from = (ctx.From ?? "").replace(/^whatsapp:/, "");
   const to = (ctx.To ?? "").replace(/^whatsapp:/, "");
   const isSamePhone = from && to && from === to;
-  const isGroup =
-    typeof ctx.From === "string" &&
-    (ctx.From.includes("@g.us") || ctx.From.startsWith("group:"));
   const abortKey = sessionKey ?? (from || undefined) ?? (to || undefined);
-  const rawBodyNormalized = (
-    sessionCtx.BodyStripped ?? sessionCtx.Body ?? ""
-  )
-    .trim()
-    .toLowerCase();
+  const rawBodyNormalized = triggerBodyNormalized;
 
   if (!sessionEntry && abortKey) {
     abortedLastRun = ABORT_MEMORY.get(abortKey) ?? false;
@@ -396,13 +508,36 @@ export async function getReplyFromConfig(
     triggerWarelayRestart();
     cleanupTyping();
     return {
-      text: "Restarting warelay via launchctl; give me a few seconds to come back online.",
+      text: "⚙️ Restarting clawdis via launchctl; give me a few seconds to come back online.",
     };
   }
 
+  if (
+    rawBodyNormalized === "/status" ||
+    rawBodyNormalized === "status" ||
+    rawBodyNormalized.startsWith("/status ")
+  ) {
+    const webLinked = await webAuthExists();
+    const webAuthAgeMs = getWebAuthAgeMs();
+    const heartbeatSeconds = resolveHeartbeatSeconds(cfg, undefined);
+    const statusText = buildStatusMessage({
+      reply,
+      sessionEntry,
+      sessionKey,
+      sessionScope,
+      storePath,
+      resolvedThink: resolvedThinkLevel,
+      resolvedVerbose: resolvedVerboseLevel,
+      webLinked,
+      webAuthAgeMs,
+      heartbeatSeconds,
+    });
+    cleanupTyping();
+    return { text: statusText };
+  }
+
   const abortRequested =
-    reply?.mode === "command" &&
-    isAbortTrigger((sessionCtx.BodyStripped ?? sessionCtx.Body ?? "").trim());
+    reply?.mode === "command" && isAbortTrigger(rawBodyNormalized);
 
   if (abortRequested) {
     if (sessionEntry && sessionStore && sessionKey) {
@@ -414,7 +549,7 @@ export async function getReplyFromConfig(
       ABORT_MEMORY.set(abortKey, true);
     }
     cleanupTyping();
-    return { text: "Agent was aborted." };
+    return { text: "⚙️ Agent was aborted." };
   }
 
   await startTypingLoop();
@@ -424,7 +559,7 @@ export async function getReplyFromConfig(
   const isFirstTurnInSession = isNewSession || !systemSent;
   const sessionIntro =
     isFirstTurnInSession && sessionCfg?.sessionIntro
-      ? applyTemplate(sessionCfg.sessionIntro, sessionCtx)
+      ? applyTemplate(sessionCfg.sessionIntro ?? "", sessionCtx)
       : "";
   const groupIntro =
     isFirstTurnInSession && sessionCtx.ChatType === "group"
@@ -446,7 +581,7 @@ export async function getReplyFromConfig(
         })()
       : "";
   const bodyPrefix = reply?.bodyPrefix
-    ? applyTemplate(reply.bodyPrefix, sessionCtx)
+    ? applyTemplate(reply.bodyPrefix ?? "", sessionCtx)
     : "";
   const baseBody = sessionCtx.BodyStripped ?? sessionCtx.Body ?? "";
   const abortedHint =
@@ -474,6 +609,26 @@ export async function getReplyFromConfig(
       await saveSessionStore(storePath, sessionStore);
     } else if (abortKey) {
       ABORT_MEMORY.set(abortKey, false);
+    }
+  }
+
+  // Prepend queued system events and (for new main sessions) a provider snapshot.
+  const isGroupSession =
+    typeof ctx.From === "string" &&
+    (ctx.From.includes("@g.us") || ctx.From.startsWith("group:"));
+  const isMainSession =
+    !isGroupSession && sessionKey === (sessionCfg?.mainKey ?? "main");
+  if (isMainSession) {
+    const systemLines: string[] = [];
+    const queued = drainSystemEvents();
+    systemLines.push(...queued);
+    if (isNewSession) {
+      const summary = await buildProviderSummary(cfg);
+      if (summary) systemLines.unshift(summary);
+    }
+    if (systemLines.length > 0) {
+      const block = systemLines.map((l) => `System: ${l}`).join("\n");
+      prefixedBodyBase = `${block}\n\n${prefixedBodyBase}`;
     }
   }
   if (
@@ -508,7 +663,7 @@ export async function getReplyFromConfig(
   const mediaNote = ctx.MediaPath?.length
     ? `[media attached: ${ctx.MediaPath}${ctx.MediaType ? ` (${ctx.MediaType})` : ""}${ctx.MediaUrl ? ` | ${ctx.MediaUrl}` : ""}]`
     : undefined;
-  // For command prompts we prepend the media note so Claude et al. see it; text replies stay clean.
+  // For command prompts we prepend the media note so Pi sees it; text replies stay clean.
   const mediaReplyHint =
     mediaNote && reply?.mode === "command"
       ? "To send an image back, add a line like: MEDIA:https://example.com/image.jpg (no spaces). Keep caption in the text body."
@@ -544,7 +699,7 @@ export async function getReplyFromConfig(
     await onReplyStart();
     logVerbose("Using text auto-reply from config");
     const result = {
-      text: applyTemplate(reply.text, templatingCtx),
+      text: applyTemplate(reply.text ?? "", templatingCtx),
       mediaUrl: reply.mediaUrl,
     };
     cleanupTyping();
@@ -617,6 +772,49 @@ export async function getReplyFromConfig(
             );
           }
         }
+
+        const usage = meta.agentMeta?.usage;
+        const model =
+          meta.agentMeta?.model ||
+          reply?.agent?.model ||
+          sessionEntry?.model ||
+          DEFAULT_MODEL;
+        const contextTokens =
+          reply?.agent?.contextTokens ??
+          lookupContextTokens(model) ??
+          sessionEntry?.contextTokens ??
+          DEFAULT_CONTEXT_TOKENS;
+
+        if (usage) {
+          const entry = sessionEntry ?? sessionStore[sessionKey];
+          if (entry) {
+            const input = usage.input ?? 0;
+            const output = usage.output ?? 0;
+            const total = usage.total ?? input + output;
+            sessionEntry = {
+              ...entry,
+              inputTokens: (entry.inputTokens ?? 0) + input,
+              outputTokens: (entry.outputTokens ?? 0) + output,
+              totalTokens: (entry.totalTokens ?? 0) + total,
+              model,
+              contextTokens: contextTokens ?? entry.contextTokens,
+              updatedAt: Date.now(),
+            };
+            sessionStore[sessionKey] = sessionEntry;
+            await saveSessionStore(storePath, sessionStore);
+          }
+        } else if (model || contextTokens) {
+          const entry = sessionEntry ?? sessionStore[sessionKey];
+          if (entry) {
+            sessionEntry = {
+              ...entry,
+              model: model ?? entry.model,
+              contextTokens: contextTokens ?? entry.contextTokens,
+            };
+            sessionStore[sessionKey] = sessionEntry;
+            await saveSessionStore(storePath, sessionStore);
+          }
+        }
       }
       if (meta.agentMeta && isVerbose()) {
         logVerbose(`Agent meta: ${JSON.stringify(meta.agentMeta)}`);
@@ -643,163 +841,4 @@ export async function getReplyFromConfig(
 
   cleanupTyping();
   return undefined;
-}
-
-type TwilioLikeClient = TwilioRequester & {
-  messages: {
-    create: (opts: {
-      from?: string;
-      to?: string;
-      body: string;
-    }) => Promise<unknown>;
-  };
-};
-
-export async function autoReplyIfConfigured(
-  client: TwilioLikeClient,
-  message: MessageInstance,
-  configOverride?: WarelayConfig,
-  runtime: RuntimeEnv = defaultRuntime,
-): Promise<void> {
-  // Fire a config-driven reply (text or command) for the inbound message, if configured.
-  const ctx: MsgContext = {
-    Body: message.body ?? undefined,
-    From: message.from ?? undefined,
-    To: message.to ?? undefined,
-    MessageSid: message.sid,
-  };
-  const replyFrom = message.to;
-  const replyTo = message.from;
-  if (!replyFrom || !replyTo) {
-    if (isVerbose())
-      console.error(
-        "Skipping auto-reply: missing to/from on inbound message",
-        ctx,
-      );
-    return;
-  }
-  const cfg = configOverride ?? loadConfig();
-  // Attach media hints for transcription/templates if present on Twilio payloads.
-  const mediaUrl = (message as { mediaUrl?: string }).mediaUrl;
-  if (mediaUrl) ctx.MediaUrl = mediaUrl;
-
-  // Optional audio transcription before building reply.
-  const mediaField = (message as { media?: unknown }).media;
-  const mediaItems = Array.isArray(mediaField) ? mediaField : [];
-  if (cfg.inbound?.transcribeAudio && mediaItems.length) {
-    const media = mediaItems[0];
-    const contentType = (media as { contentType?: string }).contentType;
-    if (contentType?.startsWith("audio")) {
-      const transcribed = await transcribeInboundAudio(cfg, ctx, runtime);
-      if (transcribed?.text) {
-        ctx.Body = transcribed.text;
-        ctx.MediaType = contentType;
-        logVerbose("Replaced Body with audio transcript for reply flow");
-      }
-    }
-  }
-
-  const sendTwilio = async (body: string, media?: string) => {
-    let resolvedMedia = media;
-    if (resolvedMedia && !/^https?:\/\//i.test(resolvedMedia)) {
-      const hosted = await ensureMediaHosted(resolvedMedia);
-      resolvedMedia = hosted.url;
-    }
-    await client.messages.create({
-      from: replyFrom,
-      to: replyTo,
-      body,
-      ...(resolvedMedia ? { mediaUrl: [resolvedMedia] } : {}),
-    });
-  };
-
-  const sendPayload = async (replyPayload: ReplyPayload) => {
-    const mediaList = replyPayload.mediaUrls?.length
-      ? replyPayload.mediaUrls
-      : replyPayload.mediaUrl
-        ? [replyPayload.mediaUrl]
-        : [];
-
-    const text = replyPayload.text ?? "";
-    const chunks = chunkText(text, TWILIO_TEXT_LIMIT);
-    if (chunks.length === 0) chunks.push("");
-
-    for (let i = 0; i < chunks.length; i++) {
-      const body = chunks[i];
-      const attachMedia = i === 0 ? mediaList[0] : undefined;
-
-      if (body) {
-        logVerbose(
-          `Auto-replying via Twilio: from ${replyFrom} to ${replyTo}, body length ${body.length}`,
-        );
-      } else if (attachMedia) {
-        logVerbose(
-          `Auto-replying via Twilio: from ${replyFrom} to ${replyTo} (media only)`,
-        );
-      }
-
-      await sendTwilio(body, attachMedia);
-
-      if (i === 0 && mediaList.length > 1) {
-        for (const extra of mediaList.slice(1)) {
-          await sendTwilio("", extra);
-        }
-      }
-
-      if (isVerbose()) {
-        console.log(
-          info(
-            `↩️  Auto-replied to ${replyTo} (sid ${message.sid ?? "no-sid"}${attachMedia ? ", media" : ""})`,
-          ),
-        );
-      }
-    }
-  };
-
-  const partialSender = async (payload: ReplyPayload) => {
-    await sendPayload(payload);
-  };
-
-  const replyResult = await getReplyFromConfig(
-    ctx,
-    {
-      onReplyStart: () => sendTypingIndicator(client, runtime, message.sid),
-      onPartialReply: partialSender,
-    },
-    cfg,
-  );
-  const replies = replyResult
-    ? Array.isArray(replyResult)
-      ? replyResult
-      : [replyResult]
-    : [];
-  if (replies.length === 0) return;
-
-  try {
-    for (const replyPayload of replies) {
-      await sendPayload(replyPayload);
-    }
-  } catch (err) {
-    const anyErr = err as {
-      code?: string | number;
-      message?: unknown;
-      moreInfo?: unknown;
-      status?: string | number;
-      response?: { body?: unknown };
-    };
-    const { code, status } = anyErr;
-    const msg =
-      typeof anyErr?.message === "string"
-        ? anyErr.message
-        : (anyErr?.message ?? err);
-    runtime.error(
-      `❌ Twilio send failed${code ? ` (code ${code})` : ""}${status ? ` status ${status}` : ""}: ${msg}`,
-    );
-    if (anyErr?.moreInfo) runtime.error(`More info: ${anyErr.moreInfo}`);
-    const responseBody = anyErr?.response?.body;
-    if (responseBody) {
-      runtime.error("Response body:");
-      runtime.error(JSON.stringify(responseBody, null, 2));
-    }
-  }
 }

@@ -150,7 +150,7 @@ export async function ensureFunnel(
     );
     runtime.error(
       info(
-        "Tip: you can fall back to polling (no webhooks needed): `pnpm warelay relay --provider twilio --interval 5 --lookback 10`",
+        "Tip: Funnel is optional for CLAWDIS. You can keep running the web relay without it: `pnpm clawdis relay`",
       ),
     );
     if (isVerbose()) {

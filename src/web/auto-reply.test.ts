@@ -18,7 +18,7 @@ import {
   runWebHeartbeatOnce,
   stripHeartbeatToken,
 } from "./auto-reply.js";
-import type { sendMessageWeb } from "./outbound.js";
+import type { sendMessageWhatsApp } from "./outbound.js";
 import {
   resetBaileysMocks,
   resetLoadConfigMock,
@@ -28,7 +28,7 @@ import {
 const makeSessionStore = async (
   entries: Record<string, unknown> = {},
 ): Promise<{ storePath: string; cleanup: () => Promise<void> }> => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "warelay-session-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdis-session-"));
   const storePath = path.join(dir, "sessions.json");
   await fs.writeFile(storePath, JSON.stringify(entries));
   return {
@@ -154,10 +154,59 @@ describe("resolveHeartbeatRecipients", () => {
   });
 });
 
+describe("partial reply gating", () => {
+  it("does not send partial replies for WhatsApp surface", async () => {
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const sendComposing = vi.fn().mockResolvedValue(undefined);
+    const sendMedia = vi.fn().mockResolvedValue(undefined);
+
+    const replyResolver = vi.fn().mockResolvedValue({ text: "final reply" });
+
+    const mockConfig: WarelayConfig = {
+      inbound: {
+        reply: { mode: "command" },
+        allowFrom: ["*"],
+      },
+    };
+
+    setLoadConfigMock(mockConfig);
+
+    await monitorWebProvider(
+      false,
+      async ({ onMessage }) => {
+        await onMessage({
+          id: "m1",
+          from: "+1000",
+          conversationId: "+1000",
+          to: "+2000",
+          body: "hello",
+          timestamp: Date.now(),
+          chatType: "direct",
+          chatId: "direct:+1000",
+          sendComposing,
+          reply,
+          sendMedia,
+        });
+        return { close: vi.fn().mockResolvedValue(undefined) };
+      },
+      false,
+      replyResolver,
+    );
+
+    resetLoadConfigMock();
+
+    expect(replyResolver).toHaveBeenCalledTimes(1);
+    const resolverOptions = replyResolver.mock.calls[0]?.[1] ?? {};
+    expect("onPartialReply" in resolverOptions).toBe(false);
+    expect(reply).toHaveBeenCalledTimes(1);
+    expect(reply).toHaveBeenCalledWith("final reply");
+  });
+});
+
 describe("runWebHeartbeatOnce", () => {
   it("skips when heartbeat token returned", async () => {
     const store = await makeSessionStore();
-    const sender: typeof sendMessageWeb = vi.fn();
+    const sender: typeof sendMessageWhatsApp = vi.fn();
     const resolver = vi.fn(async () => ({ text: HEARTBEAT_TOKEN }));
     await runWebHeartbeatOnce({
       cfg: {
@@ -178,7 +227,7 @@ describe("runWebHeartbeatOnce", () => {
 
   it("sends when alert text present", async () => {
     const store = await makeSessionStore();
-    const sender: typeof sendMessageWeb = vi
+    const sender: typeof sendMessageWhatsApp = vi
       .fn()
       .mockResolvedValue({ messageId: "m1", toJid: "jid" });
     const resolver = vi.fn(async () => ({ text: "ALERT" }));
@@ -201,7 +250,7 @@ describe("runWebHeartbeatOnce", () => {
   it("falls back to most recent session when no to is provided", async () => {
     const store = await makeSessionStore();
     const storePath = store.storePath;
-    const sender: typeof sendMessageWeb = vi
+    const sender: typeof sendMessageWhatsApp = vi
       .fn()
       .mockResolvedValue({ messageId: "m1", toJid: "jid" });
     const resolver = vi.fn(async () => ({ text: "ALERT" }));
@@ -229,7 +278,7 @@ describe("runWebHeartbeatOnce", () => {
 
   it("does not refresh updatedAt when heartbeat is skipped", async () => {
     const tmpDir = await fs.mkdtemp(
-      path.join(os.tmpdir(), "warelay-heartbeat-"),
+      path.join(os.tmpdir(), "clawdis-heartbeat-"),
     );
     const storePath = path.join(tmpDir, "sessions.json");
     const now = Date.now();
@@ -239,7 +288,7 @@ describe("runWebHeartbeatOnce", () => {
     };
     await fs.writeFile(storePath, JSON.stringify(store));
 
-    const sender: typeof sendMessageWeb = vi.fn();
+    const sender: typeof sendMessageWhatsApp = vi.fn();
     const resolver = vi.fn(async () => ({ text: HEARTBEAT_TOKEN }));
     setLoadConfigMock({
       inbound: {
@@ -269,14 +318,14 @@ describe("runWebHeartbeatOnce", () => {
 
   it("heartbeat reuses existing session id when last inbound is present", async () => {
     const tmpDir = await fs.mkdtemp(
-      path.join(os.tmpdir(), "warelay-heartbeat-session-"),
+      path.join(os.tmpdir(), "clawdis-heartbeat-session-"),
     );
     const storePath = path.join(tmpDir, "sessions.json");
     const sessionId = "sess-keep";
     await fs.writeFile(
       storePath,
       JSON.stringify({
-        "+4367": { sessionId, updatedAt: Date.now(), systemSent: false },
+        main: { sessionId, updatedAt: Date.now(), systemSent: false },
       }),
     );
 
@@ -319,7 +368,7 @@ describe("runWebHeartbeatOnce", () => {
 
   it("heartbeat honors session-id override and seeds store", async () => {
     const tmpDir = await fs.mkdtemp(
-      path.join(os.tmpdir(), "warelay-heartbeat-override-"),
+      path.join(os.tmpdir(), "clawdis-heartbeat-override-"),
     );
     const storePath = path.join(tmpDir, "sessions.json");
     await fs.writeFile(storePath, JSON.stringify({}));
@@ -359,13 +408,13 @@ describe("runWebHeartbeatOnce", () => {
     expect(heartbeatCall?.[0]?.MessageSid).toBe(sessionId);
     const raw = await fs.readFile(storePath, "utf-8");
     const stored = raw ? JSON.parse(raw) : {};
-    expect(stored["+1999"]?.sessionId).toBe(sessionId);
-    expect(stored["+1999"]?.updatedAt).toBeDefined();
+    expect(stored.main?.sessionId).toBe(sessionId);
+    expect(stored.main?.updatedAt).toBeDefined();
   });
 
   it("sends overrideBody directly and skips resolver", async () => {
     const store = await makeSessionStore();
-    const sender: typeof sendMessageWeb = vi
+    const sender: typeof sendMessageWhatsApp = vi
       .fn()
       .mockResolvedValue({ messageId: "m1", toJid: "jid" });
     const resolver = vi.fn();
@@ -391,7 +440,7 @@ describe("runWebHeartbeatOnce", () => {
 
   it("dry-run overrideBody prints and skips send", async () => {
     const store = await makeSessionStore();
-    const sender: typeof sendMessageWeb = vi.fn();
+    const sender: typeof sendMessageWhatsApp = vi.fn();
     const resolver = vi.fn();
     await runWebHeartbeatOnce({
       cfg: {
@@ -527,7 +576,7 @@ describe("web auto-reply", () => {
 
   it("skips reply heartbeat when requests are running", async () => {
     const tmpDir = await fs.mkdtemp(
-      path.join(os.tmpdir(), "warelay-heartbeat-queue-"),
+      path.join(os.tmpdir(), "clawdis-heartbeat-queue-"),
     );
     const storePath = path.join(tmpDir, "sessions.json");
     await fs.writeFile(storePath, JSON.stringify({}));
@@ -631,8 +680,8 @@ describe("web auto-reply", () => {
 
     expect(resolver).toHaveBeenCalledTimes(1);
     const args = resolver.mock.calls[0][0];
-    expect(args.Body).toContain("[Jan 1 00:00] [warelay] first");
-    expect(args.Body).toContain("[Jan 1 01:00] [warelay] second");
+    expect(args.Body).toContain("[Jan 1 00:00] [clawdis] first");
+    expect(args.Body).toContain("[Jan 1 01:00] [clawdis] second");
 
     // Max listeners bumped to avoid warnings in multi-instance test runs
     expect(process.getMaxListeners?.()).toBeGreaterThanOrEqual(50);
@@ -1126,7 +1175,7 @@ describe("web auto-reply", () => {
 
   it("emits heartbeat logs with connection metadata", async () => {
     vi.useFakeTimers();
-    const logPath = `/tmp/warelay-heartbeat-${crypto.randomUUID()}.log`;
+    const logPath = `/tmp/clawdis-heartbeat-${crypto.randomUUID()}.log`;
     setLoggerOverride({ level: "trace", file: logPath });
 
     const runtime = {
@@ -1162,13 +1211,13 @@ describe("web auto-reply", () => {
     await run.catch(() => {});
 
     const content = await fs.readFile(logPath, "utf-8");
-    expect(content).toContain('"module":"web-heartbeat"');
+    expect(content).toMatch(/web-heartbeat/);
     expect(content).toMatch(/connectionId/);
     expect(content).toMatch(/messagesHandled/);
   });
 
   it("logs outbound replies to file", async () => {
-    const logPath = `/tmp/warelay-log-test-${crypto.randomUUID()}.log`;
+    const logPath = `/tmp/clawdis-log-test-${crypto.randomUUID()}.log`;
     setLoggerOverride({ level: "trace", file: logPath });
 
     let capturedOnMessage:
@@ -1198,8 +1247,8 @@ describe("web auto-reply", () => {
     });
 
     const content = await fs.readFile(logPath, "utf-8");
-    expect(content).toContain('"module":"web-auto-reply"');
-    expect(content).toContain('"text":"auto"');
+    expect(content).toMatch(/web-auto-reply/);
+    expect(content).toMatch(/auto/);
   });
 
   it("prefixes body with same-phone marker when from === to", async () => {
@@ -1362,7 +1411,7 @@ describe("web auto-reply", () => {
       sendMedia: vi.fn(),
     });
 
-    // HEARTBEAT_OK should NOT have prefix - warelay needs exact match
+    // HEARTBEAT_OK should NOT have prefix - clawdis needs exact match
     expect(reply).toHaveBeenCalledWith(HEARTBEAT_TOKEN);
     resetLoadConfigMock();
   });

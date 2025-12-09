@@ -15,9 +15,20 @@ export type SessionEntry = {
   abortedLastRun?: boolean;
   thinkingLevel?: string;
   verboseLevel?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  model?: string;
+  contextTokens?: number;
+  // Optional flag to mirror Mac app UI and future sync states.
+  syncing?: boolean | string;
 };
 
-export const SESSION_STORE_DEFAULT = path.join(CONFIG_DIR, "sessions.json");
+export const SESSION_STORE_DEFAULT = path.join(
+  CONFIG_DIR,
+  "sessions",
+  "sessions.json",
+);
 export const DEFAULT_RESET_TRIGGER = "/new";
 export const DEFAULT_IDLE_MINUTES = 60;
 
@@ -67,4 +78,22 @@ export function deriveSessionKey(scope: SessionScope, ctx: MsgContext) {
     return ctx.From;
   }
   return from || "unknown";
+}
+
+/**
+ * Resolve the session key with a canonical direct-chat bucket (default: "main").
+ * All non-group direct chats collapse to this bucket; groups stay isolated.
+ */
+export function resolveSessionKey(
+  scope: SessionScope,
+  ctx: MsgContext,
+  mainKey?: string,
+) {
+  const raw = deriveSessionKey(scope, ctx);
+  if (scope === "global") return raw;
+  // Default to a single shared direct-chat session called "main"; groups stay isolated.
+  const canonical = (mainKey ?? "main").trim() || "main";
+  const isGroup = raw.startsWith("group:") || raw.includes("@g.us");
+  if (!isGroup) return canonical;
+  return raw;
 }

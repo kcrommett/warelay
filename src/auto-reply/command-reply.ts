@@ -1,10 +1,16 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
-
-import { type AgentKind, getAgentSpec } from "../agents/index.js";
+import type {
+  AgentEvent,
+  AssistantMessage,
+  Message,
+} from "@mariozechner/pi-ai";
+import { piSpec } from "../agents/pi.js";
 import type { AgentMeta, AgentToolResult } from "../agents/types.js";
 import type { WarelayConfig } from "../config/config.js";
 import { isVerbose, logVerbose } from "../globals.js";
+import { emitAgentEvent } from "../infra/agent-events.js";
 import { logError } from "../logger.js";
 import { getChildLogger } from "../logging.js";
 import { splitMediaFromOutput } from "../media/parse.js";
@@ -16,10 +22,125 @@ import {
   formatToolAggregate,
   shortenMeta,
   shortenPath,
-  TOOL_RESULT_FLUSH_COUNT,
   TOOL_RESULT_DEBOUNCE_MS,
+  TOOL_RESULT_FLUSH_COUNT,
 } from "./tool-meta.js";
 import type { ReplyPayload } from "./types.js";
+
+function stripStructuralPrefixes(text: string): string {
+  return text
+    .replace(/\[[^\]]+\]\s*/g, "")
+    .replace(/^[ \t]*[A-Za-z0-9+()\-_. ]+:\s*/gm, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripRpcNoise(raw: string): string {
+  // Drop rpc streaming scaffolding (toolcall deltas, audio buffer events) before parsing.
+  const lines = raw.split(/\n+/);
+  const kept: string[] = [];
+  for (const line of lines) {
+    try {
+      const evt = JSON.parse(line);
+      const type = evt?.type;
+      const msg = evt?.message ?? evt?.assistantMessageEvent;
+      const msgType = msg?.type;
+      const role = msg?.role;
+
+      // RPC streaming emits one message_update per delta; skip them to avoid flooding fallbacks.
+      if (type === "message_update") continue;
+
+      // Ignore toolcall delta chatter and input buffer append events.
+      if (type === "message_update" && msgType === "toolcall_delta") continue;
+      if (type === "input_audio_buffer.append") continue;
+
+      // Keep only assistant/tool messages; drop agent_start/turn_start/user/etc.
+      const isAssistant = role === "assistant";
+      const isToolRole =
+        typeof role === "string" && role.toLowerCase().includes("tool");
+      if (!isAssistant && !isToolRole) continue;
+
+      // Ignore assistant messages that have no text content (pure toolcall scaffolding).
+      if (msg?.role === "assistant" && Array.isArray(msg?.content)) {
+        const hasText = msg.content.some(
+          (c: unknown) => (c as { type?: string })?.type === "text",
+        );
+        if (!hasText) continue;
+      }
+    } catch {
+      // not JSON; keep as-is
+    }
+    if (line.trim()) kept.push(line);
+  }
+  return kept.join("\n");
+}
+
+function extractRpcAssistantText(raw: string): string | undefined {
+  if (!raw.trim()) return undefined;
+  let deltaBuffer = "";
+  let lastAssistant: string | undefined;
+  for (const line of raw.split(/\n+/)) {
+    try {
+      const evt = JSON.parse(line) as {
+        type?: string;
+        message?: {
+          role?: string;
+          content?: Array<{ type?: string; text?: string }>;
+        };
+        assistantMessageEvent?: {
+          type?: string;
+          delta?: string;
+          content?: string;
+        };
+      };
+      if (
+        evt.type === "message_end" &&
+        evt.message?.role === "assistant" &&
+        Array.isArray(evt.message.content)
+      ) {
+        const text = evt.message.content
+          .filter((c) => c?.type === "text" && typeof c.text === "string")
+          .map((c) => c.text as string)
+          .join("\n")
+          .trim();
+        if (text) {
+          lastAssistant = text;
+          deltaBuffer = "";
+        }
+      }
+      if (evt.type === "message_update" && evt.assistantMessageEvent) {
+        const evtType = evt.assistantMessageEvent.type;
+        if (
+          evtType === "text_delta" ||
+          evtType === "text_end" ||
+          evtType === "text_start"
+        ) {
+          const chunk =
+            typeof evt.assistantMessageEvent.delta === "string"
+              ? evt.assistantMessageEvent.delta
+              : typeof evt.assistantMessageEvent.content === "string"
+                ? evt.assistantMessageEvent.content
+                : "";
+          if (chunk) {
+            deltaBuffer += chunk;
+            lastAssistant = deltaBuffer;
+          }
+        }
+      }
+    } catch {
+      // ignore malformed/non-JSON lines
+    }
+  }
+  return lastAssistant?.trim() || undefined;
+}
+
+function extractAssistantTextLoosely(raw: string): string | undefined {
+  // Fallback: grab the last "text":"..." occurrence from a JSON-ish blob.
+  const matches = [...raw.matchAll(/"text"\s*:\s*"([^"]+?)"/g)];
+  if (!matches.length) return undefined;
+  const last = matches.at(-1)?.[1];
+  return last ? last.replace(/\\n/g, "\n").trim() : undefined;
+}
 
 type CommandReplyConfig = NonNullable<WarelayConfig["inbound"]>["reply"] & {
   mode: "command";
@@ -43,6 +164,11 @@ type CommandReplyParams = {
   thinkLevel?: ThinkLevel;
   verboseLevel?: "off" | "on";
   onPartialReply?: (payload: ReplyPayload) => Promise<void> | void;
+  runId?: string;
+  onAgentEvent?: (evt: {
+    stream: string;
+    data: Record<string, unknown>;
+  }) => void;
 };
 
 export type CommandReplyMeta = {
@@ -203,75 +329,6 @@ function normalizeToolResults(
     .filter((tr) => tr.text.length > 0);
 }
 
-export function summarizeClaudeMetadata(payload: unknown): string | undefined {
-  if (!payload || typeof payload !== "object") return undefined;
-  const obj = payload as Record<string, unknown>;
-  const parts: string[] = [];
-
-  if (typeof obj.duration_ms === "number") {
-    parts.push(`duration=${obj.duration_ms}ms`);
-  }
-  if (typeof obj.duration_api_ms === "number") {
-    parts.push(`api=${obj.duration_api_ms}ms`);
-  }
-  if (typeof obj.num_turns === "number") {
-    parts.push(`turns=${obj.num_turns}`);
-  }
-  if (typeof obj.total_cost_usd === "number") {
-    parts.push(`cost=$${obj.total_cost_usd.toFixed(4)}`);
-  }
-
-  const usage = obj.usage;
-  if (usage && typeof usage === "object") {
-    const serverToolUse = (
-      usage as { server_tool_use?: Record<string, unknown> }
-    ).server_tool_use;
-    if (serverToolUse && typeof serverToolUse === "object") {
-      const toolCalls = Object.values(serverToolUse).reduce<number>(
-        (sum, val) => {
-          if (typeof val === "number") return sum + val;
-          return sum;
-        },
-        0,
-      );
-      if (toolCalls > 0) parts.push(`tool_calls=${toolCalls}`);
-    }
-  }
-
-  const modelUsage = obj.modelUsage;
-  if (modelUsage && typeof modelUsage === "object") {
-    const models = Object.keys(modelUsage as Record<string, unknown>);
-    if (models.length) {
-      const display =
-        models.length > 2
-          ? `${models.slice(0, 2).join(",")}+${models.length - 2}`
-          : models.join(",");
-      parts.push(`models=${display}`);
-    }
-  }
-
-  return parts.length ? parts.join(", ") : undefined;
-}
-
-function appendThinkingCue(body: string, level?: ThinkLevel): string {
-  if (!level || level === "off") return body;
-  const cue = (() => {
-    switch (level) {
-      case "high":
-        return "ultrathink";
-      case "medium":
-        return "think harder";
-      case "low":
-        return "think hard";
-      case "minimal":
-        return "think";
-      default:
-        return "";
-    }
-  })();
-  return [body.trim(), cue].filter(Boolean).join(" ");
-}
-
 export async function runCommandReply(
   params: CommandReplyParams,
 ): Promise<CommandReplyResult> {
@@ -290,7 +347,7 @@ export async function runCommandReply(
     systemSent,
     timeoutMs,
     timeoutSeconds,
-    commandRunner,
+    commandRunner: _commandRunner,
     enqueue = enqueueCommand,
     thinkLevel,
     verboseLevel,
@@ -300,105 +357,146 @@ export async function runCommandReply(
   if (!reply.command?.length) {
     throw new Error("reply.command is required for mode=command");
   }
-  const agentCfg = reply.agent ?? { kind: "claude" };
-  const agentKind: AgentKind = agentCfg.kind ?? "claude";
-  const agent = getAgentSpec(agentKind);
-
-  let argv = reply.command.map((part) => applyTemplate(part, templatingCtx));
+  const agentCfg = reply.agent ?? { kind: "pi" };
+  const agent = piSpec;
+  const agentKind = "pi";
+  const rawCommand = reply.command;
+  const hasBodyTemplate = rawCommand.some((part) =>
+    /\{\{Body(Stripped)?\}\}/.test(part),
+  );
+  let argv = rawCommand.map((part) => applyTemplate(part, templatingCtx));
   const templatePrefix =
     reply.template && (!sendSystemOnce || isFirstTurnInSession || !systemSent)
       ? applyTemplate(reply.template, templatingCtx)
       : "";
+  let prefixOffset = 0;
   if (templatePrefix && argv.length > 0) {
     argv = [argv[0], templatePrefix, ...argv.slice(1)];
+    prefixOffset = 1;
   }
 
-  // Default body index is last arg
-  let bodyIndex = Math.max(argv.length - 1, 0);
+  // Extract (or synthesize) the prompt body so RPC mode works even when the
+  // command array omits {{Body}} (common for tau --mode rpc configs).
+  let bodyArg: string | undefined;
+  if (hasBodyTemplate) {
+    const idx = rawCommand.findIndex((part) =>
+      /\{\{Body(Stripped)?\}\}/.test(part),
+    );
+    const templatedIdx = idx >= 0 ? idx + prefixOffset : -1;
+    if (templatedIdx >= 0 && templatedIdx < argv.length) {
+      bodyArg = argv.splice(templatedIdx, 1)[0];
+    }
+  }
+  if (!bodyArg) {
+    bodyArg = templatingCtx.Body ?? templatingCtx.BodyStripped ?? "";
+  }
+
+  // Default body index is last arg after we append it below.
+  let bodyIndex = Math.max(argv.length, 0);
+
+  const bodyMarker = `__clawdis_body__${Math.random().toString(36).slice(2)}`;
+  let sessionArgList: string[] = [];
+  let insertSessionBeforeBody = true;
 
   // Session args prepared (templated) and injected generically
   if (reply.session) {
-    const defaultSessionArgs = (() => {
-      switch (agentCfg.kind) {
-        case "claude":
-          return {
-            newArgs: ["--session-id", "{{SessionId}}"],
-            resumeArgs: ["--resume", "{{SessionId}}"],
-          };
-        case "gemini":
-          // Gemini CLI supports --resume <id>; starting a new session needs no flag.
-          return { newArgs: [], resumeArgs: ["--resume", "{{SessionId}}"] };
-        default:
-          return {
-            newArgs: ["--session", "{{SessionId}}"],
-            resumeArgs: ["--session", "{{SessionId}}"],
-          };
-      }
-    })();
+    const defaultSessionDir = path.join(os.homedir(), ".clawdis", "sessions");
+    const sessionPath = path.join(defaultSessionDir, "{{SessionId}}.jsonl");
+    const defaultSessionArgs = {
+      newArgs: ["--session", sessionPath],
+      resumeArgs: ["--session", sessionPath],
+    };
     const defaultNew = defaultSessionArgs.newArgs;
     const defaultResume = defaultSessionArgs.resumeArgs;
-    const sessionArgList = (
+    sessionArgList = (
       isNewSession
         ? (reply.session.sessionArgNew ?? defaultNew)
         : (reply.session.sessionArgResume ?? defaultResume)
     ).map((p) => applyTemplate(p, templatingCtx));
 
+    // If we are writing session files, ensure the directory exists.
+    const sessionFlagIndex = sessionArgList.indexOf("--session");
+    const sessionPathArg =
+      sessionFlagIndex >= 0 ? sessionArgList[sessionFlagIndex + 1] : undefined;
+    if (sessionPathArg && !sessionPathArg.includes("://")) {
+      const dir = path.dirname(sessionPathArg);
+      try {
+        await fs.mkdir(dir, { recursive: true });
+      } catch {
+        // best-effort
+      }
+    }
+
     // Tau (pi agent) needs --continue to reload prior messages when resuming.
     // Without it, pi starts from a blank state even though we pass the session file path.
-    if (
-      agentKind === "pi" &&
-      !isNewSession &&
-      !sessionArgList.includes("--continue")
-    ) {
+    if (!isNewSession && !sessionArgList.includes("--continue")) {
       sessionArgList.push("--continue");
     }
 
-    if (sessionArgList.length) {
-      const insertBeforeBody = reply.session.sessionArgBeforeBody ?? true;
-      const insertAt =
-        insertBeforeBody && argv.length > 1 ? argv.length - 1 : argv.length;
-      argv = [
-        ...argv.slice(0, insertAt),
-        ...sessionArgList,
-        ...argv.slice(insertAt),
-      ];
-      bodyIndex = Math.max(argv.length - 1, 0);
-    }
+    insertSessionBeforeBody = reply.session.sessionArgBeforeBody ?? true;
+  }
+
+  if (insertSessionBeforeBody && sessionArgList.length) {
+    argv = [...argv, ...sessionArgList];
+  }
+
+  argv = [...argv, `${bodyMarker}${bodyArg}`];
+  bodyIndex = argv.length - 1;
+
+  if (!insertSessionBeforeBody && sessionArgList.length) {
+    argv = [...argv, ...sessionArgList];
   }
 
   if (thinkLevel && thinkLevel !== "off") {
-    if (agentKind === "pi") {
-      const hasThinkingFlag = argv.some(
-        (p, i) =>
-          p === "--thinking" ||
-          (i > 0 && argv[i - 1] === "--thinking") ||
-          p.startsWith("--thinking="),
-      );
-      if (!hasThinkingFlag) {
-        argv.splice(bodyIndex, 0, "--thinking", thinkLevel);
-        bodyIndex += 2;
-      }
-    } else if (argv[bodyIndex]) {
-      argv[bodyIndex] = appendThinkingCue(argv[bodyIndex] ?? "", thinkLevel);
+    const hasThinkingFlag = argv.some(
+      (p, i) =>
+        p === "--thinking" ||
+        (i > 0 && argv[i - 1] === "--thinking") ||
+        p.startsWith("--thinking="),
+    );
+    if (!hasThinkingFlag) {
+      argv.splice(bodyIndex, 0, "--thinking", thinkLevel);
+      bodyIndex += 2;
     }
   }
+  const builtArgv = agent.buildArgs({
+    argv,
+    bodyIndex,
+    isNewSession,
+    sessionId: templatingCtx.SessionId,
+    sendSystemOnce,
+    systemSent,
+    identityPrefix: agentCfg.identityPrefix,
+    format: agentCfg.format,
+  });
 
-  const shouldApplyAgent = agent.isInvocation(argv);
-  const finalArgv = shouldApplyAgent
-    ? agent.buildArgs({
-        argv,
-        bodyIndex,
-        isNewSession,
-        sessionId: templatingCtx.SessionId,
-        sendSystemOnce,
-        systemSent,
-        identityPrefix: agentCfg.identityPrefix,
-        format: agentCfg.format,
-      })
-    : argv;
+  const promptIndex = builtArgv.findIndex(
+    (arg) => typeof arg === "string" && arg.includes(bodyMarker),
+  );
+  const promptArg: string =
+    promptIndex >= 0
+      ? (builtArgv[promptIndex] as string).replace(bodyMarker, "")
+      : ((builtArgv[builtArgv.length - 1] as string | undefined) ?? "");
+
+  const finalArgv = builtArgv.map((arg, idx) => {
+    if (idx === promptIndex && typeof arg === "string") return promptArg;
+    return typeof arg === "string" ? arg.replace(bodyMarker, "") : arg;
+  });
+
+  // Drive pi via RPC stdin so auto-compaction and streaming run server-side.
+  let rpcArgv = finalArgv;
+  const bodyIdx =
+    promptIndex >= 0 ? promptIndex : Math.max(finalArgv.length - 1, 0);
+  rpcArgv = finalArgv.filter((_, idx) => idx !== bodyIdx);
+  const modeIdx = rpcArgv.indexOf("--mode");
+  if (modeIdx >= 0 && rpcArgv[modeIdx + 1]) {
+    rpcArgv[modeIdx + 1] = "rpc";
+  } else {
+    rpcArgv.push("--mode", "rpc");
+  }
 
   logVerbose(
-    `Running command auto-reply: ${finalArgv.join(" ")}${reply.cwd ? ` (cwd: ${reply.cwd})` : ""}`,
+    `Running command auto-reply: ${rpcArgv.join(" ")}${reply.cwd ? ` (cwd: ${reply.cwd})` : ""}`,
   );
   logger.info(
     {
@@ -406,7 +504,7 @@ export async function runCommandReply(
       sessionId: templatingCtx.SessionId,
       newSession: isNewSession,
       cwd: reply.cwd,
-      command: finalArgv.slice(0, -1), // omit body to reduce noise
+      command: rpcArgv.slice(0, -1), // omit body to reduce noise
     },
     "command auto-reply start",
   );
@@ -418,6 +516,7 @@ export async function runCommandReply(
     let pendingToolName: string | undefined;
     let pendingMetas: string[] = [];
     let pendingTimer: NodeJS.Timeout | null = null;
+    let streamedAny = false;
     const toolMetaById = new Map<string, string | undefined>();
     const flushPendingTool = () => {
       if (!onPartialReply) return;
@@ -429,6 +528,7 @@ export async function runCommandReply(
         text: cleanedText,
         mediaUrls: mediaFound?.length ? mediaFound : undefined,
       } as ReplyPayload);
+      streamedAny = true;
       pendingToolName = undefined;
       pendingMetas = [];
       if (pendingTimer) {
@@ -437,7 +537,7 @@ export async function runCommandReply(
       }
     };
     let lastStreamedAssistant: string | undefined;
-    const streamAssistant = (msg?: { role?: string; content?: unknown[] }) => {
+    const streamAssistantFinal = (msg?: AssistantMessage) => {
       if (!onPartialReply || msg?.role !== "assistant") return;
       const textBlocks = Array.isArray(msg.content)
         ? (msg.content as Array<{ type?: string; text?: string }>)
@@ -455,134 +555,164 @@ export async function runCommandReply(
         text: cleanedText,
         mediaUrls: mediaFound?.length ? mediaFound : undefined,
       } as ReplyPayload);
+      streamedAny = true;
     };
 
     const run = async () => {
-      // Prefer long-lived tau RPC for pi agent to avoid cold starts.
-      if (agentKind === "pi") {
-        const promptIndex = finalArgv.length - 1;
-        const body = finalArgv[promptIndex] ?? "";
-        // Build rpc args without the prompt body; force --mode rpc.
-        const rpcArgv = (() => {
-          const copy = [...finalArgv];
-          copy.splice(promptIndex, 1);
-          const modeIdx = copy.indexOf("--mode");
-          if (modeIdx >= 0 && copy[modeIdx + 1]) {
-            copy.splice(modeIdx, 2, "--mode", "rpc");
-          } else if (!copy.includes("--mode")) {
-            copy.splice(copy.length - 1, 0, "--mode", "rpc");
+      const runId = params.runId ?? crypto.randomUUID();
+      const rpcPromptIndex =
+        promptIndex >= 0 ? promptIndex : finalArgv.length - 1;
+      const body = promptArg ?? "";
+      // Build rpc args without the prompt body; force --mode rpc.
+      const rpcArgvForRun = (() => {
+        const copy = [...finalArgv];
+        copy.splice(rpcPromptIndex, 1);
+        const modeIdx = copy.indexOf("--mode");
+        if (modeIdx >= 0 && copy[modeIdx + 1]) {
+          copy.splice(modeIdx, 2, "--mode", "rpc");
+        } else if (!copy.includes("--mode")) {
+          copy.splice(copy.length - 1, 0, "--mode", "rpc");
+        }
+        return copy;
+      })();
+      type RpcStreamEvent =
+        | AgentEvent
+        // Tau sometimes emits a bare "message" frame; treat it like message_end for parsing.
+        | { type: "message"; message: Message }
+        | { type: "message_end"; message: Message };
+
+      const rpcResult = await runPiRpc({
+        argv: rpcArgvForRun,
+        cwd: reply.cwd,
+        prompt: body,
+        timeoutMs,
+        onEvent: (line: string) => {
+          let ev: RpcStreamEvent;
+          try {
+            ev = JSON.parse(line) as RpcStreamEvent;
+          } catch {
+            return;
           }
-          return copy;
-        })();
-        const rpcResult = await runPiRpc({
-          argv: rpcArgv,
-          cwd: reply.cwd,
-          prompt: body,
-          timeoutMs,
-          onEvent: onPartialReply
-            ? (line: string) => {
-                try {
-                  const ev = JSON.parse(line) as {
-                    type?: string;
-                    message?: {
-                      role?: string;
-                      content?: unknown[];
-                      details?: Record<string, unknown>;
-                      arguments?: Record<string, unknown>;
-                      toolCallId?: string;
-                      tool_call_id?: string;
-                      toolName?: string;
-                      name?: string;
-                    };
-                    toolCallId?: string;
-                    toolName?: string;
-                    args?: Record<string, unknown>;
-                  };
-                  // Capture metadata as soon as the tool starts (from args).
-                  if (ev.type === "tool_execution_start") {
-                    const toolName = ev.toolName;
-                    const meta = inferToolMeta({
-                      toolName,
-                      name: ev.toolName,
-                      arguments: ev.args,
-                    });
-                    if (ev.toolCallId) {
-                      toolMetaById.set(ev.toolCallId, meta);
-                    }
-                    if (meta) {
-                      if (
-                        pendingToolName &&
-                        toolName &&
-                        toolName !== pendingToolName
-                      ) {
-                        flushPendingTool();
-                      }
-                      if (!pendingToolName) pendingToolName = toolName;
-                      pendingMetas.push(meta);
-                      if (
-                        TOOL_RESULT_FLUSH_COUNT > 0 &&
-                        pendingMetas.length >= TOOL_RESULT_FLUSH_COUNT
-                      ) {
-                        flushPendingTool();
-                      } else {
-                        if (pendingTimer) clearTimeout(pendingTimer);
-                        pendingTimer = setTimeout(
-                          flushPendingTool,
-                          TOOL_RESULT_DEBOUNCE_MS,
-                        );
-                      }
-                    }
-                  }
-                  if (
-                    (ev.type === "message" || ev.type === "message_end") &&
-                    ev.message?.role === "tool_result" &&
-                    Array.isArray(ev.message.content)
-                  ) {
-                    const toolName = inferToolName(ev.message);
-                    const toolCallId =
-                      ev.message.toolCallId ?? ev.message.tool_call_id;
-                    const meta =
-                      inferToolMeta(ev.message) ??
-                      (toolCallId ? toolMetaById.get(toolCallId) : undefined);
-                    if (
-                      pendingToolName &&
-                      toolName &&
-                      toolName !== pendingToolName
-                    ) {
-                      flushPendingTool();
-                    }
-                    if (!pendingToolName) pendingToolName = toolName;
-                    if (meta) pendingMetas.push(meta);
-                    if (
-                      TOOL_RESULT_FLUSH_COUNT > 0 &&
-                      pendingMetas.length >= TOOL_RESULT_FLUSH_COUNT
-                    ) {
-                      flushPendingTool();
-                      return;
-                    }
-                    if (pendingTimer) clearTimeout(pendingTimer);
-                    pendingTimer = setTimeout(
-                      flushPendingTool,
-                      TOOL_RESULT_DEBOUNCE_MS,
-                    );
-                  }
-                  if (
-                    ev.type === "message_end" ||
-                    ev.type === "message_update" ||
-                    ev.type === "message"
-                  ) {
-                    streamAssistant(ev.message);
-                  }
-                } catch {
-                  // ignore malformed lines
-                }
+
+          // Forward tool lifecycle events to the agent bus.
+          if (ev.type === "tool_execution_start") {
+            emitAgentEvent({
+              runId,
+              stream: "tool",
+              data: {
+                phase: "start",
+                name: ev.toolName,
+                toolCallId: ev.toolCallId,
+                args: ev.args,
+              },
+            });
+            params.onAgentEvent?.({
+              stream: "tool",
+              data: {
+                phase: "start",
+                name: ev.toolName,
+                toolCallId: ev.toolCallId,
+              },
+            });
+          }
+
+          if (
+            "message" in ev &&
+            ev.message &&
+            (ev.type === "message" || ev.type === "message_end")
+          ) {
+            const msg = ev.message as Message & {
+              toolCallId?: string;
+              tool_call_id?: string;
+            };
+            const role = (msg.role ?? "") as string;
+            const isToolResult =
+              role === "toolResult" || role === "tool_result";
+            if (isToolResult && Array.isArray(msg.content)) {
+              const toolName = inferToolName(msg);
+              const toolCallId = msg.toolCallId ?? msg.tool_call_id;
+              const meta =
+                inferToolMeta(msg) ??
+                (toolCallId ? toolMetaById.get(toolCallId) : undefined);
+
+              emitAgentEvent({
+                runId,
+                stream: "tool",
+                data: {
+                  phase: "result",
+                  name: toolName,
+                  toolCallId,
+                  meta,
+                },
+              });
+              params.onAgentEvent?.({
+                stream: "tool",
+                data: {
+                  phase: "result",
+                  name: toolName,
+                  toolCallId,
+                  meta,
+                },
+              });
+
+              if (pendingToolName && toolName && toolName !== pendingToolName) {
+                flushPendingTool();
               }
-            : undefined,
-        });
-        flushPendingTool();
-        return rpcResult;
-      }
-      return await commandRunner(finalArgv, { timeoutMs, cwd: reply.cwd });
+              if (!pendingToolName) pendingToolName = toolName;
+              if (meta) pendingMetas.push(meta);
+              if (
+                TOOL_RESULT_FLUSH_COUNT > 0 &&
+                pendingMetas.length >= TOOL_RESULT_FLUSH_COUNT
+              ) {
+                flushPendingTool();
+                return;
+              }
+              if (pendingTimer) clearTimeout(pendingTimer);
+              pendingTimer = setTimeout(
+                flushPendingTool,
+                TOOL_RESULT_DEBOUNCE_MS,
+              );
+              return;
+            }
+
+            if (msg.role === "assistant") {
+              streamAssistantFinal(msg as AssistantMessage);
+            }
+          }
+
+          if (
+            ev.type === "message_end" &&
+            "message" in ev &&
+            ev.message &&
+            ev.message.role === "assistant"
+          ) {
+            streamAssistantFinal(ev.message as AssistantMessage);
+            const text = extractRpcAssistantText(line);
+            if (text) {
+              params.onAgentEvent?.({
+                stream: "assistant",
+                data: { text },
+              });
+            }
+          }
+
+          // Preserve existing partial reply hook when provided.
+          if (
+            onPartialReply &&
+            "message" in ev &&
+            ev.message?.role === "assistant"
+          ) {
+            // Let the existing logic reuse the already-parsed message.
+            try {
+              streamAssistantFinal(ev.message as AssistantMessage);
+            } catch {
+              /* ignore */
+            }
+          }
+        },
+      });
+      flushPendingTool();
+      return rpcResult;
     };
 
     const { stdout, stderr, code, signal, killed } = await enqueue(run, {
@@ -597,23 +727,38 @@ export async function runCommandReply(
       },
     });
     const rawStdout = stdout.trim();
+    const rpcAssistantText = extractRpcAssistantText(stdout);
     let mediaFromCommand: string[] | undefined;
-    const trimmed = rawStdout;
+    const trimmed = stripRpcNoise(rawStdout);
     if (stderr?.trim()) {
       logVerbose(`Command auto-reply stderr: ${stderr.trim()}`);
     }
 
+    const logFailure = () => {
+      const truncate = (s?: string) =>
+        s ? (s.length > 4000 ? `${s.slice(0, 4000)}…` : s) : undefined;
+      logger.warn(
+        {
+          code,
+          signal,
+          killed,
+          argv: finalArgv,
+          cwd: reply.cwd,
+          stdout: truncate(rawStdout),
+          stderr: truncate(stderr),
+        },
+        "command auto-reply failed",
+      );
+    };
+
     const parsed = trimmed ? agent.parseOutput(trimmed) : undefined;
-    const parserHasContent = !!(
-      parsed &&
-      ((parsed.texts && parsed.texts.length > 0) ||
-        (parsed.toolResults && parsed.toolResults.length > 0))
-    );
 
     // Collect assistant texts and tool results from parseOutput (tau RPC can emit many).
     const parsedTexts =
       parsed?.texts?.map((t) => t.trim()).filter(Boolean) ?? [];
     const parsedToolResults = normalizeToolResults(parsed?.toolResults);
+    const hasParsedContent =
+      parsedTexts.length > 0 || parsedToolResults.length > 0;
 
     type ReplyItem = { text: string; media?: string[] };
     const replyItems: ReplyItem[] = [];
@@ -682,10 +827,28 @@ export async function runCommandReply(
       });
     }
 
-    // If parser gave nothing, fall back to raw stdout as a single message.
-    if (replyItems.length === 0 && trimmed && !parserHasContent) {
+    // If parser gave nothing, fall back to best-effort assistant text (prefers RPC deltas).
+    const fallbackText =
+      rpcAssistantText ??
+      extractRpcAssistantText(trimmed) ??
+      extractAssistantTextLoosely(trimmed) ??
+      trimmed;
+    const normalize = (s?: string) =>
+      stripStructuralPrefixes((s ?? "").trim()).toLowerCase();
+    const bodyNorm = normalize(
+      templatingCtx.Body ?? templatingCtx.BodyStripped,
+    );
+    const fallbackNorm = normalize(fallbackText);
+    const promptEcho =
+      fallbackText &&
+      (fallbackText === (templatingCtx.Body ?? "") ||
+        fallbackText === (templatingCtx.BodyStripped ?? "") ||
+        (bodyNorm.length > 0 && bodyNorm === fallbackNorm));
+    const safeFallbackText = promptEcho ? undefined : fallbackText;
+
+    if (replyItems.length === 0 && safeFallbackText && !hasParsedContent) {
       const { text: cleanedText, mediaUrls: mediaFound } =
-        splitMediaFromOutput(trimmed);
+        splitMediaFromOutput(safeFallbackText);
       if (cleanedText || mediaFound?.length) {
         replyItems.push({
           text: cleanedText,
@@ -701,6 +864,7 @@ export async function runCommandReply(
         text: `(command produced no output${meta ? `; ${meta}` : ""})`,
       });
       verboseLog("No text/media produced; injecting fallback notice to user");
+      logFailure();
     }
 
     verboseLog(
@@ -713,12 +877,14 @@ export async function runCommandReply(
       "command auto-reply finished",
     );
     if ((code ?? 0) !== 0) {
+      logFailure();
       console.error(
         `Command auto-reply exited with code ${code ?? "unknown"} (signal: ${signal ?? "none"})`,
       );
       // Include any partial output or stderr in error message
-      const partialOut = trimmed
-        ? `\n\nOutput: ${trimmed.slice(0, 500)}${trimmed.length > 500 ? "..." : ""}`
+      const summarySource = rpcAssistantText ?? trimmed;
+      const partialOut = summarySource
+        ? `\n\nOutput: ${summarySource.slice(0, 500)}${summarySource.length > 500 ? "..." : ""}`
         : "";
       const errorText = `⚠️ Command exited with code ${code ?? "unknown"}${signal ? ` (${signal})` : ""}${partialOut}`;
       return {
@@ -810,7 +976,7 @@ export async function runCommandReply(
     }
 
     verboseLog(`Command auto-reply meta: ${JSON.stringify(meta)}`);
-    return { payloads, meta };
+    return { payloads: streamedAny && onPartialReply ? [] : payloads, meta };
   } catch (err) {
     const elapsed = Date.now() - started;
     logger.info(
@@ -830,7 +996,10 @@ export async function runCommandReply(
       const baseMsg =
         "Command timed out after " +
         `${timeoutSeconds}s${reply.cwd ? ` (cwd: ${reply.cwd})` : ""}. Try a shorter prompt or split the request.`;
-      const partial = errorObj.stdout?.trim();
+      const partial =
+        extractRpcAssistantText(errorObj.stdout ?? "") ||
+        extractAssistantTextLoosely(errorObj.stdout ?? "") ||
+        stripRpcNoise(errorObj.stdout ?? "");
       const partialSnippet =
         partial && partial.length > 800
           ? `${partial.slice(0, 800)}...`

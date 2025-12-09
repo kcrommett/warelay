@@ -5,12 +5,14 @@ import { waitForever } from "../cli/wait.js";
 import { loadConfig } from "../config/config.js";
 import {
   DEFAULT_IDLE_MINUTES,
-  deriveSessionKey,
   loadSessionStore,
+  resolveSessionKey,
   resolveStorePath,
   saveSessionStore,
 } from "../config/sessions.js";
 import { danger, info, isVerbose, logVerbose, success } from "../globals.js";
+import { emitHeartbeatEvent } from "../infra/heartbeat-events.js";
+import { enqueueSystemEvent } from "../infra/system-events.js";
 import { logInfo } from "../logger.js";
 import { getChildLogger } from "../logging.js";
 import { getQueueSize } from "../process/command-queue.js";
@@ -19,7 +21,7 @@ import { jidToE164, normalizeE164 } from "../utils.js";
 import { monitorWebInbox } from "./inbound.js";
 import { sendViaIpc, startIpcServer, stopIpcServer } from "./ipc.js";
 import { loadWebMedia } from "./media.js";
-import { sendMessageWeb } from "./outbound.js";
+import { sendMessageWhatsApp } from "./outbound.js";
 import {
   computeBackoff,
   newConnectionId,
@@ -28,10 +30,15 @@ import {
   resolveReconnectPolicy,
   sleepWithAbort,
 } from "./reconnect.js";
-import { getWebAuthAgeMs } from "./session.js";
+import { getWebAuthAgeMs, readWebSelfId } from "./session.js";
 
 const WEB_TEXT_LIMIT = 4000;
 const DEFAULT_GROUP_HISTORY_LIMIT = 50;
+
+let heartbeatsEnabled = true;
+export function setHeartbeatsEnabled(enabled: boolean) {
+  heartbeatsEnabled = enabled;
+}
 
 /**
  * Send a message via IPC if relay is running, otherwise fall back to direct.
@@ -50,7 +57,7 @@ async function sendWithIpcFallback(
     return { messageId: ipcResult.messageId, toJid: `${to}@s.whatsapp.net` };
   }
   // Fall back to direct send
-  return sendMessageWeb(to, message, opts);
+  return sendMessageWhatsApp(to, message, opts);
 }
 
 const DEFAULT_WEB_MEDIA_BYTES = 5 * 1024 * 1024;
@@ -75,6 +82,12 @@ const DEFAULT_REPLY_HEARTBEAT_MINUTES = 30;
 export const HEARTBEAT_TOKEN = "HEARTBEAT_OK";
 export const HEARTBEAT_PROMPT = "HEARTBEAT /think:high";
 
+function elide(text?: string, limit = 400) {
+  if (!text) return text;
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}… (truncated ${text.length - limit} chars)`;
+}
+
 type MentionConfig = {
   requireMention: boolean;
   mentionRegexes: RegExp[];
@@ -84,13 +97,15 @@ function buildMentionConfig(cfg: ReturnType<typeof loadConfig>): MentionConfig {
   const gc = cfg.inbound?.groupChat;
   const requireMention = gc?.requireMention !== false; // default true
   const mentionRegexes =
-    gc?.mentionPatterns?.map((p) => {
-      try {
-        return new RegExp(p, "i");
-      } catch {
-        return null;
-      }
-    }).filter((r): r is RegExp => Boolean(r)) ?? [];
+    gc?.mentionPatterns
+      ?.map((p) => {
+        try {
+          return new RegExp(p, "i");
+        } catch {
+          return null;
+        }
+      })
+      .filter((r): r is RegExp => Boolean(r)) ?? [];
   return { requireMention, mentionRegexes };
 }
 
@@ -181,7 +196,7 @@ export async function runWebHeartbeatOnce(opts: {
   verbose?: boolean;
   replyResolver?: typeof getReplyFromConfig;
   runtime?: RuntimeEnv;
-  sender?: typeof sendMessageWeb;
+  sender?: typeof sendMessageWhatsApp;
   sessionId?: string;
   overrideBody?: string;
   dryRun?: boolean;
@@ -205,11 +220,15 @@ export async function runWebHeartbeatOnce(opts: {
   });
 
   const cfg = cfgOverride ?? loadConfig();
+  const sessionCfg = cfg.inbound?.reply?.session;
+  const sessionScope = sessionCfg?.scope ?? "per-sender";
+  const mainKey = sessionCfg?.mainKey;
+  const sessionKey = resolveSessionKey(sessionScope, { From: to }, mainKey);
   if (sessionId) {
     const storePath = resolveStorePath(cfg.inbound?.reply?.session?.store);
     const store = loadSessionStore(storePath);
-    store[to] = {
-      ...(store[to] ?? {}),
+    store[sessionKey] = {
+      ...(store[sessionKey] ?? {}),
       sessionId,
       updatedAt: Date.now(),
     };
@@ -244,6 +263,12 @@ export async function runWebHeartbeatOnce(opts: {
         return;
       }
       const sendResult = await sender(to, overrideBody, { verbose });
+      emitHeartbeatEvent({
+        status: "sent",
+        to,
+        preview: overrideBody.slice(0, 160),
+        hasMedia: false,
+      });
       heartbeatLogger.info(
         {
           to,
@@ -290,6 +315,7 @@ export async function runWebHeartbeatOnce(opts: {
         "heartbeat skipped",
       );
       if (verbose) console.log(success("heartbeat: ok (empty reply)"));
+      emitHeartbeatEvent({ status: "ok-empty", to });
       return;
     }
 
@@ -299,8 +325,7 @@ export async function runWebHeartbeatOnce(opts: {
     const stripped = stripHeartbeatToken(replyPayload.text);
     if (stripped.shouldSkip && !hasMedia) {
       // Don't let heartbeats keep sessions alive: restore previous updatedAt so idle expiry still works.
-      const sessionCfg = cfg.inbound?.reply?.session;
-      const storePath = resolveStorePath(sessionCfg?.store);
+      const storePath = resolveStorePath(cfg.inbound?.reply?.session?.store);
       const store = loadSessionStore(storePath);
       if (sessionSnapshot.entry && store[sessionSnapshot.key]) {
         store[sessionSnapshot.key].updatedAt = sessionSnapshot.entry.updatedAt;
@@ -312,6 +337,7 @@ export async function runWebHeartbeatOnce(opts: {
         "heartbeat skipped",
       );
       console.log(success("heartbeat: ok (HEARTBEAT_OK)"));
+      emitHeartbeatEvent({ status: "ok-token", to });
       return;
     }
 
@@ -335,21 +361,32 @@ export async function runWebHeartbeatOnce(opts: {
     }
 
     const sendResult = await sender(to, finalText, { verbose });
+    emitHeartbeatEvent({
+      status: "sent",
+      to,
+      preview: finalText.slice(0, 160),
+      hasMedia,
+    });
     heartbeatLogger.info(
-      { to, messageId: sendResult.messageId, chars: finalText.length },
+      {
+        to,
+        messageId: sendResult.messageId,
+        chars: finalText.length,
+        preview: elide(finalText, 140),
+      },
       "heartbeat sent",
     );
     console.log(success(`heartbeat: alert sent to ${to}`));
   } catch (err) {
     heartbeatLogger.warn({ to, error: String(err) }, "heartbeat failed");
     console.log(danger(`heartbeat: failed - ${String(err)}`));
+    emitHeartbeatEvent({ status: "failed", to, reason: String(err) });
     throw err;
   }
 }
 
 function getFallbackRecipient(cfg: ReturnType<typeof loadConfig>) {
-  const sessionCfg = cfg.inbound?.reply?.session;
-  const storePath = resolveStorePath(sessionCfg?.store);
+  const storePath = resolveStorePath(cfg.inbound?.reply?.session?.store);
   const store = loadSessionStore(storePath);
   const candidates = Object.entries(store).filter(([key]) => key !== "global");
   if (candidates.length === 0) {
@@ -370,7 +407,7 @@ function getSessionRecipients(cfg: ReturnType<typeof loadConfig>) {
   const sessionCfg = cfg.inbound?.reply?.session;
   const scope = sessionCfg?.scope ?? "per-sender";
   if (scope === "global") return [];
-  const storePath = resolveStorePath(sessionCfg?.store);
+  const storePath = resolveStorePath(cfg.inbound?.reply?.session?.store);
   const store = loadSessionStore(storePath);
   return Object.entries(store)
     .filter(([key]) => key !== "global" && key !== "unknown")
@@ -421,7 +458,11 @@ function getSessionSnapshot(
 ) {
   const sessionCfg = cfg.inbound?.reply?.session;
   const scope = sessionCfg?.scope ?? "per-sender";
-  const key = deriveSessionKey(scope, { From: from, To: "", Body: "" });
+  const key = resolveSessionKey(
+    scope,
+    { From: from, To: "", Body: "" },
+    sessionCfg?.mainKey,
+  );
   const store = loadSessionStore(resolveStorePath(sessionCfg?.store));
   const entry = store[key];
   const idleMinutes = Math.max(
@@ -479,7 +520,7 @@ async function deliverWebReply(params: {
         connectionId: connectionId ?? null,
         to: msg.from,
         from: msg.to,
-        text: replyResult.text,
+        text: elide(replyResult.text, 240),
         mediaUrl: null,
         mediaSizeBytes: null,
         mediaKind: null,
@@ -688,7 +729,7 @@ export async function monitorWebProvider(
       let messagePrefix = cfg.inbound?.messagePrefix;
       if (messagePrefix === undefined) {
         const hasAllowFrom = (cfg.inbound?.allowFrom?.length ?? 0) > 0;
-        messagePrefix = hasAllowFrom ? "" : "[warelay]";
+        messagePrefix = hasAllowFrom ? "" : "[clawdis]";
       }
       const prefixStr = messagePrefix ? `${messagePrefix} ` : "";
       const senderLabel =
@@ -728,7 +769,7 @@ export async function monitorWebProvider(
         const senderLabel =
           latest.senderName && latest.senderE164
             ? `${latest.senderName} (${latest.senderE164})`
-            : latest.senderName ?? latest.senderE164 ?? "Unknown";
+            : (latest.senderName ?? latest.senderE164 ?? "Unknown");
         combinedBody = `${combinedBody}\\n[from: ${senderLabel}]`;
         // Clear stored history after using it
         groupHistories.set(conversationId, []);
@@ -748,7 +789,7 @@ export async function monitorWebProvider(
           correlationId,
           from: latest.chatType === "group" ? conversationId : latest.from,
           to: latest.to,
-          body: combinedBody,
+          body: elide(combinedBody, 240),
           mediaType: latest.mediaType ?? null,
           mediaPath: latest.mediaPath ?? null,
           batchSize: messages.length,
@@ -779,6 +820,7 @@ export async function monitorWebProvider(
           GroupMembers: latest.groupParticipants?.join(", "),
           SenderName: latest.senderName,
           SenderE164: latest.senderE164,
+          Surface: "whatsapp",
         },
         {
           onReplyStart: latest.sendComposing,
@@ -834,7 +876,7 @@ export async function monitorWebProvider(
           const fromDisplay =
             latest.chatType === "group"
               ? conversationId
-              : latest.from ?? "unknown";
+              : (latest.from ?? "unknown");
           if (isVerbose()) {
             console.log(
               success(
@@ -850,24 +892,26 @@ export async function monitorWebProvider(
           }
         } catch (err) {
           console.error(
-            danger(`Failed sending web auto-reply to ${latest.from ?? conversationId}: ${String(err)}`),
+            danger(
+              `Failed sending web auto-reply to ${latest.from ?? conversationId}: ${String(err)}`,
+            ),
           );
         }
       }
-      };
+    };
 
-      const enqueueBatch = async (msg: WebInboundMsg) => {
-        const key = msg.conversationId ?? msg.from;
-        const bucket = pendingBatches.get(key) ?? { messages: [] };
-        bucket.messages.push(msg);
-        pendingBatches.set(key, bucket);
-        if (getQueueSize() === 0) {
-          await processBatch(key);
-        } else {
-          bucket.timer =
-            bucket.timer ?? setTimeout(() => void processBatch(key), 150);
-        }
-      };
+    const enqueueBatch = async (msg: WebInboundMsg) => {
+      const key = msg.conversationId ?? msg.from;
+      const bucket = pendingBatches.get(key) ?? { messages: [] };
+      bucket.messages.push(msg);
+      pendingBatches.set(key, bucket);
+      if (getQueueSize() === 0) {
+        await processBatch(key);
+      } else {
+        bucket.timer =
+          bucket.timer ?? setTimeout(() => void processBatch(key), 150);
+      }
+    };
 
     const listener = await (listenerFactory ?? monitorWebInbox)({
       verbose,
@@ -926,7 +970,13 @@ export async function monitorWebProvider(
       },
     });
 
-    // Start IPC server so `warelay send` can use this connection
+    // Surface a concise connection event for the next main-session turn/heartbeat.
+    const { e164: selfE164 } = readWebSelfId();
+    enqueueSystemEvent(
+      `WhatsApp relay connected${selfE164 ? ` as ${selfE164}` : ""}.`,
+    );
+
+    // Start IPC server so `clawdis send` can use this connection
     // instead of creating a new one (which would corrupt Signal session)
     if ("sendMessage" in listener && "sendComposingTo" in listener) {
       startIpcServer(async (to, message, mediaUrl) => {
@@ -979,6 +1029,7 @@ export async function monitorWebProvider(
 
     if (keepAlive) {
       heartbeat = setInterval(() => {
+        if (!heartbeatsEnabled) return;
         const authAgeMs = getWebAuthAgeMs();
         const minutesSinceLastMessage = lastMessageAt
           ? Math.floor((Date.now() - lastMessageAt) / 60000)
@@ -1034,6 +1085,7 @@ export async function monitorWebProvider(
     }
 
     const runReplyHeartbeat = async () => {
+      if (!heartbeatsEnabled) return;
       const queued = getQueueSize();
       if (queued > 0) {
         heartbeatLogger.info(
@@ -1235,6 +1287,7 @@ export async function monitorWebProvider(
     if (replyHeartbeatMinutes && !replyHeartbeatTimer) {
       const intervalMs = replyHeartbeatMinutes * 60_000;
       replyHeartbeatTimer = setInterval(() => {
+        if (!heartbeatsEnabled) return;
         void runReplyHeartbeat();
       }, intervalMs);
       if (tuning.replyHeartbeatNow) {
@@ -1293,10 +1346,14 @@ export async function monitorWebProvider(
       "web reconnect: connection closed",
     );
 
+    enqueueSystemEvent(
+      `WhatsApp relay disconnected (status ${status ?? "unknown"})`,
+    );
+
     if (loggedOut) {
       runtime.error(
         danger(
-          "WhatsApp session logged out. Run `warelay login --provider web` to relink.",
+          "WhatsApp session logged out. Run `clawdis login --provider web` to relink.",
         ),
       );
       await closeListener();

@@ -40,7 +40,7 @@ describe("loginWeb coverage", () => {
       .mockResolvedValueOnce(undefined);
 
     const runtime = { log: vi.fn(), error: vi.fn() } as never;
-    await loginWeb(false, waitForWaConnection as never, runtime);
+    await loginWeb(false, "web", waitForWaConnection as never, runtime);
 
     expect(createWaSocket).toHaveBeenCalledTimes(2);
     const firstSock = await createWaSocket.mock.results[0].value;
@@ -55,9 +55,9 @@ describe("loginWeb coverage", () => {
       output: { statusCode: DisconnectReason.loggedOut },
     });
 
-    await expect(loginWeb(false, waitForWaConnection as never)).rejects.toThrow(
-      /cache cleared/i,
-    );
+    await expect(
+      loginWeb(false, "web", waitForWaConnection as never),
+    ).rejects.toThrow(/cache cleared/i);
     expect(rmMock).toHaveBeenCalledWith("/tmp/wa-creds", {
       recursive: true,
       force: true,
@@ -66,9 +66,9 @@ describe("loginWeb coverage", () => {
 
   it("formats and rethrows generic errors", async () => {
     waitForWaConnection.mockRejectedValueOnce(new Error("boom"));
-    await expect(loginWeb(false, waitForWaConnection as never)).rejects.toThrow(
-      "formatted:Error: boom",
-    );
+    await expect(
+      loginWeb(false, "web", waitForWaConnection as never),
+    ).rejects.toThrow("formatted:Error: boom");
     expect(formatError).toHaveBeenCalled();
   });
 });

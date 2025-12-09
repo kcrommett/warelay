@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import {
   DisconnectReason,
@@ -14,34 +13,26 @@ import qrcode from "qrcode-terminal";
 
 import { SESSION_STORE_DEFAULT } from "../config/sessions.js";
 import { danger, info, success } from "../globals.js";
-import { getChildLogger } from "../logging.js";
+import { getChildLogger, toPinoLikeLogger } from "../logging.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
 import type { Provider } from "../utils.js";
-import { ensureDir, jidToE164 } from "../utils.js";
+import { CONFIG_DIR, ensureDir, jidToE164 } from "../utils.js";
 import { VERSION } from "../version.js";
 
-export const WA_WEB_AUTH_DIR = path.join(
-  os.homedir(),
-  ".warelay",
-  "credentials",
-);
+export const WA_WEB_AUTH_DIR = path.join(CONFIG_DIR, "credentials");
 
 /**
  * Create a Baileys socket backed by the multi-file auth store we keep on disk.
  * Consumers can opt into QR printing for interactive login flows.
  */
 export async function createWaSocket(printQr: boolean, verbose: boolean) {
-  const logger = getChildLogger(
+  const baseLogger = getChildLogger(
     { module: "baileys" },
     {
       level: verbose ? "info" : "silent",
     },
   );
-  // Some Baileys internals call logger.trace even when silent; ensure it's present.
-  const loggerAny = logger as unknown as Record<string, unknown>;
-  if (typeof loggerAny.trace !== "function") {
-    loggerAny.trace = () => {};
-  }
+  const logger = toPinoLikeLogger(baseLogger, verbose ? "info" : "silent");
   await ensureDir(WA_WEB_AUTH_DIR);
   const { state, saveCreds } = await useMultiFileAuthState(WA_WEB_AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
@@ -53,7 +44,7 @@ export async function createWaSocket(printQr: boolean, verbose: boolean) {
     version,
     logger,
     printQRInTerminal: false,
-    browser: ["warelay", "cli", VERSION],
+    browser: ["clawdis", "cli", VERSION],
     syncFullHistory: false,
     markOnlineOnConnect: false,
   });
@@ -74,7 +65,7 @@ export async function createWaSocket(printQr: boolean, verbose: boolean) {
           const status = getStatusCode(lastDisconnect?.error);
           if (status === DisconnectReason.loggedOut) {
             console.error(
-              danger("WhatsApp session logged out. Run: warelay login"),
+              danger("WhatsApp session logged out. Run: clawdis login"),
             );
           }
         }
@@ -167,7 +158,7 @@ export async function logoutWeb(runtime: RuntimeEnv = defaultRuntime) {
   return true;
 }
 
-function readWebSelfId() {
+export function readWebSelfId() {
   // Read the cached WhatsApp Web identity (jid + E.164) from disk if present.
   const credsPath = path.join(WA_WEB_AUTH_DIR, "creds.json");
   try {
@@ -217,9 +208,12 @@ export function logWebSelfId(
 }
 
 export async function pickProvider(pref: Provider | "auto"): Promise<Provider> {
-  // Auto-select web when logged in; otherwise fall back to twilio.
-  if (pref !== "auto") return pref;
+  const choice: Provider = pref === "auto" ? "web" : pref;
   const hasWeb = await webAuthExists();
-  if (hasWeb) return "web";
-  return "twilio";
+  if (!hasWeb) {
+    throw new Error(
+      "No WhatsApp Web session found. Run `clawdis login --verbose` to link.",
+    );
+  }
+  return choice;
 }

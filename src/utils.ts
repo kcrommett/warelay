@@ -1,16 +1,17 @@
 import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import { isVerbose, logVerbose } from "./globals.js";
 
 export async function ensureDir(dir: string) {
   await fs.promises.mkdir(dir, { recursive: true });
 }
 
-export type Provider = "twilio" | "web";
+export type Provider = "web";
 
 export function assertProvider(input: string): asserts input is Provider {
-  if (input !== "twilio" && input !== "web") {
-    throw new Error("Provider must be 'twilio' or 'web'");
+  if (input !== "web") {
+    throw new Error("Provider must be 'web'");
   }
 }
 
@@ -70,4 +71,5 @@ export function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export const CONFIG_DIR = `${os.homedir()}/.warelay`;
+// Fixed configuration root; legacy ~/.clawdis is no longer used.
+export const CONFIG_DIR = path.join(os.homedir(), ".clawdis");

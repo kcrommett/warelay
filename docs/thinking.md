@@ -21,8 +21,7 @@
 - Confirmation reply is sent (`Thinking level set to high.` / `Thinking disabled.`). If the level is invalid (e.g. `/thinking big`), the command is rejected with a hint and the session state is left unchanged.
 
 ## Application by agent
-- **Pi/Tau**: injects `--thinking <level>` (skipped for `off`).
-- **Claude & other text agents**: appends the cue word to the prompt text as above.
+- **Pi/Tau**: injects `--thinking <level>` (skipped for `off`). Other agent paths have been removed.
 
 ## Verbose directives (/verbose or /v)
 - Levels: `on|full` or `off` (default).
@@ -32,3 +31,8 @@
 
 ## Heartbeats
 - Heartbeat probe body is `HEARTBEAT /think:high`, so it always asks for max thinking on the probe. Inline directive wins; session/global defaults are used only when no directive is present.
+
+## Web chat UI
+- The web chat thinking selector mirrors the session's stored level from the inbound session store/config when the page loads.
+- Picking another level applies only to the next message (`thinkingOnce`); after sending, the selector snaps back to the stored session level.
+- To change the session default, send a `/think:<level>` directive (as before); the selector will reflect it after the next reload.

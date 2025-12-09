@@ -1,96 +1,48 @@
 import type { CliDeps } from "../cli/deps.js";
 import { info, success } from "../globals.js";
 import type { RuntimeEnv } from "../runtime.js";
-import type { Provider } from "../utils.js";
 import { sendViaIpc } from "../web/ipc.js";
 
 export async function sendCommand(
   opts: {
     to: string;
     message: string;
-    wait: string;
-    poll: string;
-    provider: Provider;
+    provider?: string;
     json?: boolean;
     dryRun?: boolean;
     media?: string;
-    serveMedia?: boolean;
   },
   deps: CliDeps,
   runtime: RuntimeEnv,
 ) {
-  deps.assertProvider(opts.provider);
-  const waitSeconds = Number.parseInt(opts.wait, 10);
-  const pollSeconds = Number.parseInt(opts.poll, 10);
+  const provider = (opts.provider ?? "whatsapp").toLowerCase();
 
-  if (Number.isNaN(waitSeconds) || waitSeconds < 0) {
-    throw new Error("Wait must be >= 0 seconds");
-  }
-  if (Number.isNaN(pollSeconds) || pollSeconds <= 0) {
-    throw new Error("Poll must be > 0 seconds");
+  if (opts.dryRun) {
+    runtime.log(
+      `[dry-run] would send via ${provider} -> ${opts.to}: ${opts.message}${opts.media ? ` (media ${opts.media})` : ""}`,
+    );
+    return;
   }
 
-  if (opts.provider === "web") {
-    if (opts.dryRun) {
-      runtime.log(
-        `[dry-run] would send via web -> ${opts.to}: ${opts.message}${opts.media ? ` (media ${opts.media})` : ""}`,
-      );
-      return;
-    }
-    if (waitSeconds !== 0) {
-      runtime.log(info("Wait/poll are Twilio-only; ignored for provider=web."));
-    }
-
-    // Try to send via IPC to running relay first (avoids Signal session corruption)
-    const ipcResult = await sendViaIpc(opts.to, opts.message, opts.media);
-    if (ipcResult) {
-      if (ipcResult.success) {
-        runtime.log(
-          success(`✅ Sent via relay IPC. Message ID: ${ipcResult.messageId}`),
-        );
-        if (opts.json) {
-          runtime.log(
-            JSON.stringify(
-              {
-                provider: "web",
-                via: "ipc",
-                to: opts.to,
-                messageId: ipcResult.messageId,
-                mediaUrl: opts.media ?? null,
-              },
-              null,
-              2,
-            ),
-          );
-        }
-        return;
-      }
-      // IPC failed but relay is running - warn and fall back
-      runtime.log(
-        info(
-          `IPC send failed (${ipcResult.error}), falling back to direct connection`,
-        ),
-      );
-    }
-
-    // Fall back to direct connection (creates new Baileys socket)
-    const res = await deps
-      .sendMessageWeb(opts.to, opts.message, {
-        verbose: false,
-        mediaUrl: opts.media,
-      })
-      .catch((err) => {
-        runtime.error(`❌ Web send failed: ${String(err)}`);
-        throw err;
-      });
+  if (provider === "telegram") {
+    const result = await deps.sendMessageTelegram(opts.to, opts.message, {
+      token: process.env.TELEGRAM_BOT_TOKEN,
+      mediaUrl: opts.media,
+    });
+    runtime.log(
+      success(
+        `✅ Sent via telegram. Message ID: ${result.messageId} (chat ${result.chatId})`,
+      ),
+    );
     if (opts.json) {
       runtime.log(
         JSON.stringify(
           {
-            provider: "web",
+            provider: "telegram",
             via: "direct",
             to: opts.to,
-            messageId: res.messageId,
+            chatId: result.chatId,
+            messageId: result.messageId,
             mediaUrl: opts.media ?? null,
           },
           null,
@@ -101,48 +53,61 @@ export async function sendCommand(
     return;
   }
 
-  if (opts.dryRun) {
+  // Try to send via IPC to running relay first (avoids Signal session corruption)
+  const ipcResult = await sendViaIpc(opts.to, opts.message, opts.media);
+  if (ipcResult) {
+    if (ipcResult.success) {
+      runtime.log(
+        success(`✅ Sent via relay IPC. Message ID: ${ipcResult.messageId}`),
+      );
+      if (opts.json) {
+        runtime.log(
+          JSON.stringify(
+            {
+              provider: "web",
+              via: "ipc",
+              to: opts.to,
+              messageId: ipcResult.messageId,
+              mediaUrl: opts.media ?? null,
+            },
+            null,
+            2,
+          ),
+        );
+      }
+      return;
+    }
+    // IPC failed but relay is running - warn and fall back
     runtime.log(
-      `[dry-run] would send via twilio -> ${opts.to}: ${opts.message}${opts.media ? ` (media ${opts.media})` : ""}`,
+      info(
+        `IPC send failed (${ipcResult.error}), falling back to direct connection`,
+      ),
     );
-    return;
   }
 
-  let mediaUrl: string | undefined;
-  if (opts.media) {
-    mediaUrl = await deps.resolveTwilioMediaUrl(opts.media, {
-      serveMedia: Boolean(opts.serveMedia),
-      runtime,
+  // Fall back to direct connection (creates new Baileys socket)
+  const res = await deps
+    .sendMessageWhatsApp(opts.to, opts.message, {
+      verbose: false,
+      mediaUrl: opts.media,
+    })
+    .catch((err) => {
+      runtime.error(`❌ Web send failed: ${String(err)}`);
+      throw err;
     });
-  }
-
-  const result = await deps.sendMessage(
-    opts.to,
-    opts.message,
-    { mediaUrl },
-    runtime,
-  );
   if (opts.json) {
     runtime.log(
       JSON.stringify(
         {
-          provider: "twilio",
+          provider: "web",
+          via: "direct",
           to: opts.to,
-          sid: result?.sid ?? null,
-          mediaUrl: mediaUrl ?? null,
+          messageId: res.messageId,
+          mediaUrl: opts.media ?? null,
         },
         null,
         2,
       ),
     );
   }
-  if (!result) return;
-  if (waitSeconds === 0) return;
-  await deps.waitForFinalStatus(
-    result.client,
-    result.sid,
-    waitSeconds,
-    pollSeconds,
-    runtime,
-  );
 }

@@ -1,21 +1,21 @@
 # Agent Integration 🤖
 
-CLAWDIS can work with any AI agent that accepts prompts via CLI. Here's how to set them up.
+CLAWDIS now ships with a single coding agent: Pi (the Tau CLI). Legacy Claude/Codex/Gemini/Opencode paths have been removed.
+Pi is bundled as a dependency of `clawdis`, so a fresh `pnpm install` gives you the `pi`/`tau` binaries automatically.
 
-## Supported Agents
+## Pi / Tau
 
-### Tau / Pi
-
-The recommended agent for CLAWDIS. Built by Mario Zechner, forked with love.
+The recommended (and only) agent for CLAWDIS. Built by Mario Zechner, forked with love.
 
 ```json
 {
   "reply": {
     "mode": "command",
-    "agent": {
-      "kind": "pi",
-      "format": "json"
-    },
+  "agent": {
+    "kind": "pi",
+    "format": "json",
+    "model": "claude-opus-4-5" // default if omitted
+  },
     "command": [
       "node",
       "/path/to/pi-mono/packages/coding-agent/dist/cli.js",
@@ -41,39 +41,12 @@ For streaming tool output and better integration:
 }
 ```
 
-RPC mode gives you:
+RPC mode is enforced by CLAWDIS (we rewrite `--mode` to `rpc` for Pi invocations). It gives you:
 - 💻 Real-time tool execution display
 - 📊 Token usage tracking
 - 🔄 Streaming responses
 
-### Claude Code
-
-```json
-{
-  "command": [
-    "claude",
-    "-p",
-    "{{BodyStripped}}"
-  ]
-}
-```
-
-### Custom Agents
-
-Any CLI that:
-1. Accepts a prompt as an argument
-2. Outputs text to stdout
-3. Exits when done
-
-```json
-{
-  "command": [
-    "/path/to/my-agent",
-    "--prompt", "{{Body}}",
-    "--format", "text"
-  ]
-}
-```
+If the agent does not report a model, CLAWDIS assumes `claude-opus-4-5` with ~200k context tokens (pi-ai defaults) for usage summaries.
 
 ## Session Management
 
@@ -90,6 +63,7 @@ Each phone number gets its own conversation history:
   }
 }
 ```
+By default CLAWDIS stores sessions under `~/.clawdis/sessions` and will create the folder automatically.
 
 ### Global Session
 
