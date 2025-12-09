@@ -15,7 +15,7 @@ import { logError } from "../logger.js";
 import { getChildLogger } from "../logging.js";
 import { splitMediaFromOutput } from "../media/parse.js";
 import { enqueueCommand } from "../process/command-queue.js";
-import type { runCommandWithTimeout } from "../process/exec.js";
+import { runCommandWithTimeout, type runCommandWithTimeout as RunCommandWithTimeoutType } from "../process/exec.js";
 import { runPiRpc } from "../process/tau-rpc.js";
 import { applyTemplate, type TemplateContext } from "./templating.js";
 import {
@@ -338,6 +338,9 @@ export async function runCommandReply(
     if (isVerbose()) logVerbose(msg);
   };
 
+  // MARKER: code rebuild verification 2025-12-09T07:35
+  logger.info({ marker: "REBUILD_2025_12_09_0735" }, "command-reply loaded");
+
   const {
     reply,
     templatingCtx,
@@ -357,6 +360,11 @@ export async function runCommandReply(
   if (!reply.command?.length) {
     throw new Error("reply.command is required for mode=command");
   }
+
+  // Check if this is a claude command (not pi/tau) - skip pi-specific flags
+  const isClaudeCommand = reply.command[0]?.includes("claude");
+  logger.info({ isClaudeCommand, command: reply.command[0] }, "agent detection");
+
   const agentCfg = reply.agent ?? { kind: "pi" };
   const agent = piSpec;
   const agentKind = "pi";
@@ -447,7 +455,8 @@ export async function runCommandReply(
     argv = [...argv, ...sessionArgList];
   }
 
-  if (thinkLevel && thinkLevel !== "off") {
+  // Only add --thinking for pi/tau, not for claude
+  if (!isClaudeCommand && thinkLevel && thinkLevel !== "off") {
     const hasThinkingFlag = argv.some(
       (p, i) =>
         p === "--thinking" ||
@@ -560,6 +569,22 @@ export async function runCommandReply(
 
     const run = async () => {
       const runId = params.runId ?? crypto.randomUUID();
+
+      // For Claude commands, use simple subprocess execution (no RPC mode)
+      if (isClaudeCommand) {
+        logger.info({ argv: finalArgv, cwd: reply.cwd }, "running claude command directly");
+        const result = await runCommandWithTimeout(finalArgv, {
+          timeoutMs: timeoutMs ?? 600_000,
+          cwd: reply.cwd
+        });
+        return {
+          stdout: result.stdout,
+          stderr: result.stderr,
+          code: result.code ?? 0,
+          signal: result.signal,
+        };
+      }
+
       const rpcPromptIndex =
         promptIndex >= 0 ? promptIndex : finalArgv.length - 1;
       const body = promptArg ?? "";
